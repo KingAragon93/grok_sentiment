@@ -1,0 +1,378 @@
+"""
+Grok Sentiment Cloud Function
+
+A Cloud Run function that provides real-time sentiment analysis for stock tickers
+using xAI's Agent Tools API with x_search to analyze X/Twitter posts.
+
+Usage:
+    POST request with JSON body:
+    {
+        "symbol": "SOFI",
+        "hours_back": 24,        # Optional, default 24
+        "max_turns": 2,          # Optional, default 2 (cost control)
+        "send_to_discord": false # Optional, default false
+    }
+
+Returns:
+    {
+        "status": "success",
+        "symbol": "SOFI",
+        "sentiment_score": 8.5,
+        "summary": "Bullish sentiment with...",
+        "citations_count": 45,
+        "tool_usage": {"SERVER_SIDE_TOOL_X_SEARCH": 2},
+        "api_call_duration": 12.5,
+        "model_used": "grok-4-1-fast"
+    }
+"""
+
+import os
+import json
+import logging
+import time
+import datetime
+import pytz
+import functions_framework
+from flask import jsonify
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Try to import xai_sdk
+try:
+    from xai_sdk import Client as XAIClient
+    from xai_sdk.chat import user
+    from xai_sdk.tools import x_search
+    XAI_SDK_AVAILABLE = True
+    logger.info("✅ xai_sdk imported successfully")
+except ImportError as e:
+    XAI_SDK_AVAILABLE = False
+    logger.error(f"❌ xai_sdk not available: {e}")
+
+# Try to import requests for Discord
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+# Environment variables
+XAI_API_KEY = os.environ.get('XAI_API_KEY')
+DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL', '')
+
+# Validate API key on startup
+if XAI_API_KEY:
+    logger.info("✅ XAI_API_KEY found in environment")
+else:
+    logger.warning("⚠️ XAI_API_KEY not found in environment variables")
+
+
+def get_et_timezone():
+    """Get Eastern timezone for consistent logging."""
+    return pytz.timezone('America/New_York')
+
+
+def now_et():
+    """Get current time in Eastern timezone."""
+    return datetime.datetime.now(get_et_timezone())
+
+
+def send_discord_message(webhook_url: str, message: str, embed: dict = None):
+    """Send a message to Discord webhook."""
+    if not REQUESTS_AVAILABLE:
+        logger.warning("requests library not available for Discord")
+        return False
+    
+    if not webhook_url:
+        logger.warning("No Discord webhook URL provided")
+        return False
+    
+    try:
+        payload = {"content": message[:2000]}  # Discord limit
+        if embed:
+            payload["embeds"] = [embed]
+        
+        response = requests.post(webhook_url, json=payload, timeout=10)
+        response.raise_for_status()
+        logger.info("✅ Discord message sent successfully")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to send Discord message: {e}")
+        return False
+
+
+def analyze_sentiment(symbol: str, hours_back: int = 24, max_turns: int = 2):
+    """
+    Analyze sentiment for a stock symbol using xAI Agent Tools API.
+    
+    Args:
+        symbol: Stock ticker symbol (e.g., "SOFI", "AAPL")
+        hours_back: How many hours of X posts to analyze (default 24)
+        max_turns: Maximum tool call turns for cost control (default 2)
+    
+    Returns:
+        dict with sentiment_score, summary, citations_count, etc.
+    """
+    if not XAI_SDK_AVAILABLE:
+        return {
+            "status": "error",
+            "reason": "xai_sdk not available. Install with: pip install xai-sdk>=1.5.0",
+            "symbol": symbol
+        }
+    
+    if not XAI_API_KEY:
+        return {
+            "status": "error",
+            "reason": "XAI_API_KEY not configured in environment variables",
+            "symbol": symbol
+        }
+    
+    # Initialize client
+    try:
+        xai_client = XAIClient(api_key=XAI_API_KEY)
+        logger.info(f"✅ xAI client initialized for {symbol}")
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"Failed to initialize xAI client: {e}",
+            "symbol": symbol
+        }
+    
+    # Calculate date ranges
+    now = datetime.datetime.now(pytz.UTC)
+    from_date = now - datetime.timedelta(hours=hours_back)
+    to_date = now
+    
+    # User prompt for sentiment analysis
+    user_prompt = (
+        f"Analyze sentiment for ${symbol} stock on X/Twitter. "
+        f"Search for posts from the last {hours_back} hours about ${symbol}. "
+        f"Compare the last {hours_back//2} hours vs previous {hours_back//2} hours to detect any sentiment shifts. "
+        f"Provide your analysis as JSON with exactly these keys: "
+        f"'sentiment_score' (number from -10 to +10), "
+        f"'summary' (ONE sentence max 100 words: sentiment shift direction, main catalyst, price alignment). "
+        f"Return ONLY the JSON object, no other text."
+    )
+    
+    start_time = time.time()
+    model_used = "grok-4-1-fast"
+    
+    try:
+        # Create chat with x_search tool only (cost-efficient)
+        chat = xai_client.chat.create(
+            model=model_used,
+            tools=[
+                x_search(
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+            ],
+            max_turns=max_turns,
+        )
+        
+        # Add the user message
+        chat.append(user(user_prompt))
+        
+        # Get the response (non-streaming)
+        response = chat.sample()
+        
+        api_call_duration = time.time() - start_time
+        response_content = response.content
+        
+        # Parse JSON from response
+        sentiment_score = 0.0
+        summary = "Unable to parse response"
+        
+        try:
+            json_str = response_content
+            # Handle markdown code blocks
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(json_str)
+            sentiment_score = float(data.get("sentiment_score", 0.0))
+            summary = str(data.get("summary", "Summary not provided."))
+        except (json.JSONDecodeError, IndexError) as parse_error:
+            logger.warning(f"JSON parse failed for {symbol}: {parse_error}")
+            summary = response_content[:500] if response_content else "Unable to parse response"
+        
+        # Get usage stats
+        tool_usage = {}
+        if hasattr(response, 'server_side_tool_usage'):
+            tool_usage = dict(response.server_side_tool_usage) if response.server_side_tool_usage else {}
+        
+        citations_count = len(response.citations) if hasattr(response, 'citations') and response.citations else 0
+        citations = list(response.citations)[:10] if hasattr(response, 'citations') and response.citations else []
+        
+        logger.info(f"✅ {symbol} analyzed | Score: {sentiment_score:.1f}/10 | Time: {api_call_duration:.2f}s | Citations: {citations_count}")
+        
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "sentiment_score": sentiment_score,
+            "summary": summary,
+            "raw_response": response_content,
+            "citations_count": citations_count,
+            "citations_sample": citations,
+            "tool_usage": tool_usage,
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
+            "hours_back": hours_back,
+            "timestamp": now_et().isoformat()
+        }
+        
+    except Exception as e:
+        api_call_duration = time.time() - start_time
+        logger.error(f"❌ Error analyzing {symbol}: {e}")
+        return {
+            "status": "error",
+            "symbol": symbol,
+            "reason": str(e),
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
+            "timestamp": now_et().isoformat()
+        }
+
+
+def format_discord_embed(result: dict) -> dict:
+    """Format the result as a Discord embed."""
+    if result.get("status") != "success":
+        return {
+            "title": f"❌ Sentiment Analysis Failed: {result.get('symbol', 'Unknown')}",
+            "description": result.get("reason", "Unknown error"),
+            "color": 15158332  # Red
+        }
+    
+    score = result.get("sentiment_score", 0)
+    
+    # Determine color based on sentiment
+    if score > 3:
+        color = 3066993  # Green
+        emoji = "🟢"
+        direction = "BULLISH"
+    elif score < -3:
+        color = 15158332  # Red
+        emoji = "🔴"
+        direction = "BEARISH"
+    else:
+        color = 16776960  # Yellow
+        emoji = "⚪"
+        direction = "NEUTRAL"
+    
+    return {
+        "title": f"📊 Sentiment Analysis: {result.get('symbol')}",
+        "description": result.get("summary", "No summary available"),
+        "color": color,
+        "fields": [
+            {
+                "name": "Sentiment Score",
+                "value": f"{emoji} **{score:.1f}/10** ({direction})",
+                "inline": True
+            },
+            {
+                "name": "X Posts Analyzed",
+                "value": f"📱 {result.get('citations_count', 0)} posts",
+                "inline": True
+            },
+            {
+                "name": "Analysis Time",
+                "value": f"⏱️ {result.get('api_call_duration', 0):.1f}s",
+                "inline": True
+            },
+            {
+                "name": "Tool Usage",
+                "value": f"🔧 {result.get('tool_usage', {})}",
+                "inline": False
+            }
+        ],
+        "footer": {
+            "text": f"Powered by xAI Grok | {result.get('model_used', 'grok-4-1-fast')}"
+        },
+        "timestamp": result.get("timestamp", now_et().isoformat())
+    }
+
+
+@functions_framework.http
+def grok_sentiment(request):
+    """
+    HTTP Cloud Function for Grok sentiment analysis.
+    
+    Request JSON body:
+    {
+        "symbol": "SOFI",           # Required: Stock ticker
+        "hours_back": 24,           # Optional: Hours of X posts to analyze (default 24)
+        "max_turns": 2,             # Optional: Max tool call turns (default 2)
+        "send_to_discord": false,   # Optional: Send result to Discord (default false)
+        "discord_webhook_url": ""   # Optional: Override default Discord webhook
+    }
+    """
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    # Set CORS headers for the main response
+    headers = {'Access-Control-Allow-Origin': '*'}
+    
+    # Parse request
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({
+                "status": "error",
+                "reason": "No JSON body provided"
+            }), 400, headers
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "reason": f"Failed to parse JSON: {e}"
+        }), 400, headers
+    
+    # Extract parameters
+    symbol = request_json.get('symbol', '').upper().strip()
+    if not symbol:
+        return jsonify({
+            "status": "error",
+            "reason": "Missing required parameter: symbol"
+        }), 400, headers
+    
+    hours_back = request_json.get('hours_back', 24)
+    max_turns = request_json.get('max_turns', 2)
+    send_to_discord = request_json.get('send_to_discord', False)
+    discord_webhook = request_json.get('discord_webhook_url', DISCORD_WEBHOOK_URL)
+    
+    logger.info(f"📊 Analyzing sentiment for {symbol} (hours_back={hours_back}, max_turns={max_turns})")
+    
+    # Run sentiment analysis
+    result = analyze_sentiment(
+        symbol=symbol,
+        hours_back=hours_back,
+        max_turns=max_turns
+    )
+    
+    # Send to Discord if requested
+    if send_to_discord and discord_webhook:
+        embed = format_discord_embed(result)
+        send_discord_message(discord_webhook, "", embed)
+    
+    return jsonify(result), 200, headers
+
+
+# For local testing with functions-framework
+if __name__ == "__main__":
+    import sys
+    
+    # Quick test without HTTP
+    test_symbol = sys.argv[1] if len(sys.argv) > 1 else "SOFI"
+    print(f"\n🧪 Testing Grok Sentiment for {test_symbol}...\n")
+    
+    result = analyze_sentiment(test_symbol, hours_back=24, max_turns=2)
+    print(json.dumps(result, indent=2))

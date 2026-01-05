@@ -1,0 +1,11 @@
+# Cloud Functions Framework
+functions-framework==3.*
+
+# xAI SDK for Agent Tools API (Grok sentiment analysis)
+xai-sdk>=1.5.0
+
+# Time/Date handling
+pytz>=2024.1
+
+# HTTP requests (for Discord webhook)
+requests>=2.31.0

@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Cloud Functions: grok_sentiment",
+            "type": "cloudcode.cloudfunctions",
+            "request": "launch",
+            "functionName": "grok_sentiment",
+            "source": "${workspaceFolder}",
+            "target": "grok_sentiment",
+            "port": 8080
+        },
+        {
+            "name": "Python: Local Test",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "args": ["SOFI"],
+            "console": "integratedTerminal",
+            "env": {
+                "XAI_API_KEY": "${env:XAI_API_KEY}"
+            }
+        }
+    ]
+}

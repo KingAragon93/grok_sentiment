@@ -237,6 +237,149 @@ def analyze_sentiment(symbol: str, hours_back: int = 24, max_turns: int = 2):
         }
 
 
+def get_stock_recommendation(symbol: str, max_turns: int = 2):
+    """
+    Get a buy/hold/sell recommendation for a stock symbol using xAI Agent Tools API.
+    
+    Args:
+        symbol: Stock ticker symbol (e.g., "SOFI", "AAPL")
+        max_turns: Maximum tool call turns for cost control (default 2)
+    
+    Returns:
+        dict with recommendation (buy/hold/sell), buy_signal (bool), summary, etc.
+    """
+    if not XAI_SDK_AVAILABLE:
+        return {
+            "status": "error",
+            "reason": "xai_sdk not available. Install with: pip install xai-sdk>=1.5.0",
+            "symbol": symbol
+        }
+    
+    if not XAI_API_KEY:
+        return {
+            "status": "error",
+            "reason": "XAI_API_KEY not configured in environment variables",
+            "symbol": symbol
+        }
+    
+    # Initialize client
+    try:
+        xai_client = XAIClient(api_key=XAI_API_KEY)
+        logger.info(f"✅ xAI client initialized for {symbol} recommendation")
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"Failed to initialize xAI client: {e}",
+            "symbol": symbol
+        }
+    
+    # Get current time in ET
+    current_time_et = now_et()
+    formatted_time = current_time_et.strftime("%B %d, %Y, %I:%M %p ET")
+    
+    # Calculate date ranges for x_search
+    now_utc = datetime.datetime.now(pytz.UTC)
+    from_date = now_utc - datetime.timedelta(hours=72)  # Look back 72 hours for context
+    to_date = now_utc
+    
+    # User prompt for stock recommendation
+    user_prompt = (
+        f"Recommend buy/hold/sell for ${symbol} as of {formatted_time}. "
+        f"Factor in recent trends, fundamentals, and key news/risks. "
+        f"Structure: Trend Summary (brief), Fundamentals (brief), News Impact (focus on negatives), "
+        f"Recommendation (yes/no with why). Keep under 400 words. "
+        f"Provide your analysis as JSON with exactly these keys: "
+        f"'recommendation' (string: 'buy', 'hold', or 'sell'), "
+        f"'summary' (string: your full analysis under 400 words). "
+        f"Return ONLY the JSON object, no other text."
+    )
+    
+    start_time = time.time()
+    model_used = "grok-4-1-fast"
+    
+    try:
+        # Create chat with x_search tool
+        chat = xai_client.chat.create(
+            model=model_used,
+            tools=[
+                x_search(
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+            ],
+            max_turns=max_turns,
+        )
+        
+        # Add the user message
+        chat.append(user(user_prompt))
+        
+        # Get the response (non-streaming)
+        response = chat.sample()
+        
+        api_call_duration = time.time() - start_time
+        response_content = response.content
+        
+        # Parse JSON from response
+        recommendation = "hold"
+        summary = "Unable to parse response"
+        
+        try:
+            json_str = response_content
+            # Handle markdown code blocks
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(json_str)
+            recommendation = str(data.get("recommendation", "hold")).lower().strip()
+            summary = str(data.get("summary", "Summary not provided."))
+        except (json.JSONDecodeError, IndexError) as parse_error:
+            logger.warning(f"JSON parse failed for {symbol} recommendation: {parse_error}")
+            summary = response_content[:500] if response_content else "Unable to parse response"
+        
+        # Normalize recommendation and determine buy_signal
+        if recommendation not in ["buy", "hold", "sell"]:
+            recommendation = "hold"
+        buy_signal = recommendation == "buy"
+        
+        # Get usage stats
+        tool_usage = {}
+        if hasattr(response, 'server_side_tool_usage'):
+            tool_usage = dict(response.server_side_tool_usage) if response.server_side_tool_usage else {}
+        
+        citations_count = len(response.citations) if hasattr(response, 'citations') and response.citations else 0
+        
+        logger.info(f"✅ {symbol} recommendation | {recommendation.upper()} | Buy Signal: {buy_signal} | Time: {api_call_duration:.2f}s")
+        
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "recommendation": recommendation,
+            "buy_signal": buy_signal,
+            "summary": summary,
+            "raw_response": response_content,
+            "citations_count": citations_count,
+            "tool_usage": tool_usage,
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
+            "analysis_time": formatted_time,
+            "timestamp": current_time_et.isoformat()
+        }
+        
+    except Exception as e:
+        api_call_duration = time.time() - start_time
+        logger.error(f"❌ Error getting recommendation for {symbol}: {e}")
+        return {
+            "status": "error",
+            "symbol": symbol,
+            "reason": str(e),
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
+            "timestamp": now_et().isoformat()
+        }
+
+
 def format_discord_embed(result: dict) -> dict:
     """Format the result as a Discord embed."""
     if result.get("status") != "success":
@@ -366,13 +509,144 @@ def grok_sentiment(request):
     return jsonify(result), 200, headers
 
 
+@functions_framework.http
+def grok_recommendation(request):
+    """
+    HTTP Cloud Function for Grok stock recommendation.
+    
+    Request JSON body:
+    {
+        "symbol": "SOFI",           # Required: Stock ticker
+        "max_turns": 2,             # Optional: Max tool call turns (default 2)
+        "send_to_discord": false,   # Optional: Send result to Discord (default false)
+        "discord_webhook_url": ""   # Optional: Override default Discord webhook
+    }
+    """
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    # Set CORS headers for the main response
+    headers = {'Access-Control-Allow-Origin': '*'}
+    
+    # Parse request
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({
+                "status": "error",
+                "reason": "No JSON body provided"
+            }), 400, headers
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "reason": f"Failed to parse JSON: {e}"
+        }), 400, headers
+    
+    # Extract parameters
+    symbol = request_json.get('symbol', '').upper().strip()
+    if not symbol:
+        return jsonify({
+            "status": "error",
+            "reason": "Missing required parameter: symbol"
+        }), 400, headers
+    
+    max_turns = request_json.get('max_turns', 2)
+    send_to_discord = request_json.get('send_to_discord', False)
+    discord_webhook = request_json.get('discord_webhook_url', DISCORD_WEBHOOK_URL)
+    
+    logger.info(f"📈 Getting recommendation for {symbol} (max_turns={max_turns})")
+    
+    # Run recommendation analysis
+    result = get_stock_recommendation(
+        symbol=symbol,
+        max_turns=max_turns
+    )
+    
+    # Send to Discord if requested
+    if send_to_discord and discord_webhook:
+        embed = format_recommendation_embed(result)
+        send_discord_message(discord_webhook, "", embed)
+    
+    return jsonify(result), 200, headers
+
+
+def format_recommendation_embed(result: dict) -> dict:
+    """Format the recommendation result as a Discord embed."""
+    if result.get("status") != "success":
+        return {
+            "title": f"❌ Recommendation Failed: {result.get('symbol', 'Unknown')}",
+            "description": result.get("reason", "Unknown error"),
+            "color": 15158332  # Red
+        }
+    
+    recommendation = result.get("recommendation", "hold")
+    buy_signal = result.get("buy_signal", False)
+    
+    # Determine color and emoji based on recommendation
+    if recommendation == "buy":
+        color = 3066993  # Green
+        emoji = "🟢"
+    elif recommendation == "sell":
+        color = 15158332  # Red
+        emoji = "🔴"
+    else:
+        color = 16776960  # Yellow
+        emoji = "⚪"
+    
+    return {
+        "title": f"📈 Stock Recommendation: {result.get('symbol')}",
+        "description": result.get("summary", "No summary available")[:4000],  # Discord limit
+        "color": color,
+        "fields": [
+            {
+                "name": "Recommendation",
+                "value": f"{emoji} **{recommendation.upper()}**",
+                "inline": True
+            },
+            {
+                "name": "Buy Signal",
+                "value": f"{'✅ YES' if buy_signal else '❌ NO'}",
+                "inline": True
+            },
+            {
+                "name": "Analysis Time",
+                "value": f"⏱️ {result.get('api_call_duration', 0):.1f}s",
+                "inline": True
+            },
+            {
+                "name": "As Of",
+                "value": f"🕐 {result.get('analysis_time', 'N/A')}",
+                "inline": False
+            }
+        ],
+        "footer": {
+            "text": f"Powered by xAI Grok | {result.get('model_used', 'grok-4-1-fast')}"
+        },
+        "timestamp": result.get("timestamp", now_et().isoformat())
+    }
+
+
 # For local testing with functions-framework
 if __name__ == "__main__":
     import sys
     
     # Quick test without HTTP
+    # Usage: python main.py SOFI [sentiment|recommendation]
     test_symbol = sys.argv[1] if len(sys.argv) > 1 else "SOFI"
-    print(f"\n🧪 Testing Grok Sentiment for {test_symbol}...\n")
+    test_mode = sys.argv[2] if len(sys.argv) > 2 else "sentiment"
     
-    result = analyze_sentiment(test_symbol, hours_back=24, max_turns=2)
+    if test_mode == "recommendation":
+        print(f"\n📈 Testing Grok Recommendation for {test_symbol}...\n")
+        result = get_stock_recommendation(test_symbol, max_turns=2)
+    else:
+        print(f"\n🧪 Testing Grok Sentiment for {test_symbol}...\n")
+        result = analyze_sentiment(test_symbol, hours_back=24, max_turns=2)
+    
     print(json.dumps(result, indent=2))

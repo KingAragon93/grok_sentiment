@@ -284,10 +284,11 @@ def get_stock_recommendation(symbol: str, max_turns: int = 2):
     
     # User prompt for stock recommendation
     user_prompt = (
+        f"**For short-term trade: Predict if ${symbol} will go up over the next few hours and recommend buy if yes.** "
         f"Recommend buy/hold/sell for ${symbol} as of {formatted_time}. "
-        f"Factor in recent trends, fundamentals, and key news/risks. "
-        f"Structure: Trend Summary (brief), Fundamentals (brief), News Impact (focus on negatives), "
-        f"Recommendation (yes/no with why). Keep under 400 words. "
+        f"Factor in recent trends, fundamentals, key news, risks, and opportunities. "
+        f"Structure: Trend Summary (brief, focus on intraday), Fundamentals (brief), News Impact (balanced positives and negatives), "
+        f"Recommendation (buy/hold/sell with why). Keep under 400 words. "
         f"Provide your analysis as JSON with exactly these keys: "
         f"'recommendation' (string: 'buy', 'hold', or 'sell'), "
         f"'summary' (string: your full analysis under 400 words). "

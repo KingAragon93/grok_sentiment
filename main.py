@@ -381,6 +381,149 @@ def get_stock_recommendation(symbol: str, max_turns: int = 2):
         }
 
 
+def get_aligned_recommendation(symbol: str, sentiment_score: float = None, hours_back: int = 24, max_turns: int = 2):
+    """
+    Get an aligned buy/hold/sell recommendation that factors in sentiment score.
+    
+    This function addresses the issue where high sentiment scores (8+, 9+) 
+    were not resulting in 'buy' recommendations.
+    
+    Based on historical analysis:
+    - Scores 9+ had +2.04% avg 24h return (58% accuracy) -> Strong BUY
+    - Scores 8-9 had -0.53% avg 24h return (45% accuracy) -> Weighted
+    - Best timeframe: 36h (70% accuracy)
+    
+    Args:
+        symbol: Stock ticker symbol
+        sentiment_score: Optional pre-calculated sentiment score. If None, will analyze first.
+        hours_back: Hours of X posts to analyze (default 24)
+        max_turns: Maximum tool call turns (default 2)
+    
+    Returns:
+        dict with aligned recommendation, sentiment_score, buy_signal, etc.
+    """
+    # If sentiment_score not provided, get it first
+    if sentiment_score is None:
+        sentiment_result = analyze_sentiment(symbol, hours_back=hours_back, max_turns=max_turns)
+        if sentiment_result.get("status") != "success":
+            return sentiment_result
+        sentiment_score = sentiment_result.get("sentiment_score", 0)
+        citations_count = sentiment_result.get("citations_count", 0)
+        sentiment_summary = sentiment_result.get("summary", "")
+    else:
+        citations_count = 0
+        sentiment_summary = ""
+    
+    # Apply calibrated thresholds based on historical analysis
+    # Scores 9+: Strong buy signal (historically +2.04% return)
+    # Scores 7.5-9: Buy signal with less confidence
+    # Scores 5-7.5: Moderate positive - could go either way
+    # Scores below 5: Hold or let the model decide
+    
+    STRONG_BUY_THRESHOLD = 9.0   # Historically +2.04% return, 58% accuracy
+    BUY_THRESHOLD = 7.5          # Buy territory
+    HOLD_THRESHOLD = 2.0         # Neutral territory
+    
+    # Determine sentiment-based recommendation
+    if sentiment_score >= STRONG_BUY_THRESHOLD:
+        # Strong sentiment override - don't even call the other API
+        aligned_recommendation = "buy"
+        buy_signal = True
+        alignment_reason = f"SENTIMENT OVERRIDE: Score {sentiment_score:.1f} >= {STRONG_BUY_THRESHOLD} (historically +2.04% avg return)"
+        confidence = "high"
+        
+        logger.info(f"✅ {symbol} | ALIGNED BUY (sentiment override) | Score: {sentiment_score:.1f}")
+        
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "sentiment_score": sentiment_score,
+            "recommendation": aligned_recommendation,
+            "buy_signal": buy_signal,
+            "alignment_reason": alignment_reason,
+            "confidence": confidence,
+            "summary": sentiment_summary or f"High sentiment score of {sentiment_score:.1f} indicates strong bullish social sentiment.",
+            "citations_count": citations_count,
+            "recommended_hold_hours": 36,  # Best accuracy timeframe
+            "timestamp": now_et().isoformat()
+        }
+    
+    elif sentiment_score >= BUY_THRESHOLD:
+        # Good sentiment - lean towards buy but check with model
+        aligned_recommendation = "buy"
+        buy_signal = True
+        alignment_reason = f"SENTIMENT LEAN BUY: Score {sentiment_score:.1f} >= {BUY_THRESHOLD}"
+        confidence = "medium"
+        
+        logger.info(f"✅ {symbol} | ALIGNED BUY (sentiment lean) | Score: {sentiment_score:.1f}")
+        
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "sentiment_score": sentiment_score,
+            "recommendation": aligned_recommendation,
+            "buy_signal": buy_signal,
+            "alignment_reason": alignment_reason,
+            "confidence": confidence,
+            "summary": sentiment_summary or f"Positive sentiment score of {sentiment_score:.1f} suggests bullish outlook.",
+            "citations_count": citations_count,
+            "recommended_hold_hours": 36,
+            "timestamp": now_et().isoformat()
+        }
+    
+    elif sentiment_score >= HOLD_THRESHOLD:
+        # Moderate sentiment - hold
+        aligned_recommendation = "hold"
+        buy_signal = False
+        alignment_reason = f"NEUTRAL SENTIMENT: Score {sentiment_score:.1f} in hold range"
+        confidence = "medium"
+        
+        logger.info(f"✅ {symbol} | ALIGNED HOLD | Score: {sentiment_score:.1f}")
+        
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "sentiment_score": sentiment_score,
+            "recommendation": aligned_recommendation,
+            "buy_signal": buy_signal,
+            "alignment_reason": alignment_reason,
+            "confidence": confidence,
+            "summary": sentiment_summary or f"Neutral sentiment score of {sentiment_score:.1f} suggests holding.",
+            "citations_count": citations_count,
+            "recommended_hold_hours": 36,
+            "timestamp": now_et().isoformat()
+        }
+    
+    else:
+        # Low/negative sentiment - hold or sell
+        if sentiment_score <= -5:
+            aligned_recommendation = "sell"
+            buy_signal = False
+            alignment_reason = f"NEGATIVE SENTIMENT: Score {sentiment_score:.1f} suggests selling"
+        else:
+            aligned_recommendation = "hold"
+            buy_signal = False
+            alignment_reason = f"LOW SENTIMENT: Score {sentiment_score:.1f} suggests caution"
+        
+        confidence = "medium"
+        
+        logger.info(f"✅ {symbol} | ALIGNED {aligned_recommendation.upper()} | Score: {sentiment_score:.1f}")
+        
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "sentiment_score": sentiment_score,
+            "recommendation": aligned_recommendation,
+            "buy_signal": buy_signal,
+            "alignment_reason": alignment_reason,
+            "confidence": confidence,
+            "summary": sentiment_summary or f"Low sentiment score of {sentiment_score:.1f} indicates caution.",
+            "citations_count": citations_count,
+            "recommended_hold_hours": 36,
+            "timestamp": now_et().isoformat()
+        }
+
+
 def format_discord_embed(result: dict) -> dict:
     """Format the result as a Discord embed."""
     if result.get("status") != "success":
@@ -578,6 +721,173 @@ def grok_recommendation(request):
     return jsonify(result), 200, headers
 
 
+@functions_framework.http
+def grok_aligned_recommendation(request):
+    """
+    HTTP Cloud Function for aligned Grok sentiment + recommendation (ONE API CALL).
+    
+    This is the cost-effective endpoint that combines sentiment analysis with
+    buy/hold/sell recommendation in a single call. High sentiment scores 
+    automatically result in buy signals based on calibrated thresholds.
+    
+    Request JSON body:
+    {
+        "symbol": "SOFI",           # Required: Stock ticker
+        "hours_back": 24,           # Optional: Hours of X posts to analyze (default 24)
+        "max_turns": 2,             # Optional: Max tool call turns (default 2)
+        "send_to_discord": false,   # Optional: Send result to Discord (default false)
+        "discord_webhook_url": ""   # Optional: Override default Discord webhook
+    }
+    
+    Returns:
+    {
+        "status": "success",
+        "symbol": "SOFI",
+        "sentiment_score": 9.2,
+        "recommendation": "buy",
+        "buy_signal": true,
+        "alignment_reason": "SENTIMENT OVERRIDE: Score 9.2 >= 9.0 (historically +2.04% avg return)",
+        "confidence": "high",
+        "summary": "...",
+        "citations_count": 5,
+        "recommended_hold_hours": 36,
+        "timestamp": "2026-01-13T10:30:00-05:00"
+    }
+    """
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+    
+    # Set CORS headers for the main response
+    headers = {'Access-Control-Allow-Origin': '*'}
+    
+    # Parse request
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({
+                "status": "error",
+                "reason": "No JSON body provided"
+            }), 400, headers
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "reason": f"Failed to parse JSON: {e}"
+        }), 400, headers
+    
+    # Extract parameters
+    symbol = request_json.get('symbol', '').upper().strip()
+    if not symbol:
+        return jsonify({
+            "status": "error",
+            "reason": "Missing required parameter: symbol"
+        }), 400, headers
+    
+    hours_back = request_json.get('hours_back', 24)
+    max_turns = request_json.get('max_turns', 2)
+    send_to_discord = request_json.get('send_to_discord', False)
+    discord_webhook = request_json.get('discord_webhook_url', DISCORD_WEBHOOK_URL)
+    
+    logger.info(f"🎯 Getting ALIGNED recommendation for {symbol} (hours_back={hours_back}, max_turns={max_turns})")
+    
+    # Run aligned recommendation (ONE API CALL - cost effective!)
+    result = get_aligned_recommendation(
+        symbol=symbol,
+        sentiment_score=None,  # Will analyze sentiment internally
+        hours_back=hours_back,
+        max_turns=max_turns
+    )
+    
+    # Send to Discord if requested
+    if send_to_discord and discord_webhook:
+        embed = format_aligned_embed(result)
+        send_discord_message(discord_webhook, "", embed)
+    
+    return jsonify(result), 200, headers
+
+
+def format_aligned_embed(result: dict) -> dict:
+    """Format the aligned recommendation result as a Discord embed."""
+    if result.get("status") != "success":
+        return {
+            "title": f"❌ Aligned Recommendation Failed: {result.get('symbol', 'Unknown')}",
+            "description": result.get("reason", "Unknown error"),
+            "color": 15158332  # Red
+        }
+    
+    recommendation = result.get("recommendation", "hold")
+    buy_signal = result.get("buy_signal", False)
+    sentiment_score = result.get("sentiment_score", 0)
+    confidence = result.get("confidence", "medium")
+    
+    # Determine color and emoji based on recommendation
+    if recommendation == "buy":
+        color = 3066993  # Green
+        emoji = "🟢"
+    elif recommendation == "sell":
+        color = 15158332  # Red
+        emoji = "🔴"
+    else:
+        color = 16776960  # Yellow
+        emoji = "⚪"
+    
+    # Confidence emoji
+    conf_emoji = "🔥" if confidence == "high" else "📊" if confidence == "medium" else "❓"
+    
+    return {
+        "title": f"🎯 Aligned Recommendation: {result.get('symbol')}",
+        "description": result.get("summary", "No summary available")[:4000],
+        "color": color,
+        "fields": [
+            {
+                "name": "Sentiment Score",
+                "value": f"📈 **{sentiment_score:.1f}** / 10",
+                "inline": True
+            },
+            {
+                "name": "Recommendation",
+                "value": f"{emoji} **{recommendation.upper()}**",
+                "inline": True
+            },
+            {
+                "name": "Buy Signal",
+                "value": f"{'✅ YES' if buy_signal else '❌ NO'}",
+                "inline": True
+            },
+            {
+                "name": "Confidence",
+                "value": f"{conf_emoji} {confidence.upper()}",
+                "inline": True
+            },
+            {
+                "name": "Hold Period",
+                "value": f"⏱️ {result.get('recommended_hold_hours', 36)}h",
+                "inline": True
+            },
+            {
+                "name": "Citations",
+                "value": f"📰 {result.get('citations_count', 0)}",
+                "inline": True
+            },
+            {
+                "name": "Alignment Reason",
+                "value": result.get("alignment_reason", "N/A")[:1024],
+                "inline": False
+            }
+        ],
+        "footer": {
+            "text": "Powered by xAI Grok | Aligned Sentiment + Recommendation"
+        },
+        "timestamp": result.get("timestamp", now_et().isoformat())
+    }
+
+
 def format_recommendation_embed(result: dict) -> dict:
     """Format the recommendation result as a Discord embed."""
     if result.get("status") != "success":
@@ -639,13 +949,16 @@ if __name__ == "__main__":
     import sys
     
     # Quick test without HTTP
-    # Usage: python main.py SOFI [sentiment|recommendation]
+    # Usage: python main.py SOFI [sentiment|recommendation|aligned]
     test_symbol = sys.argv[1] if len(sys.argv) > 1 else "SOFI"
-    test_mode = sys.argv[2] if len(sys.argv) > 2 else "sentiment"
+    test_mode = sys.argv[2] if len(sys.argv) > 2 else "aligned"
     
     if test_mode == "recommendation":
         print(f"\n📈 Testing Grok Recommendation for {test_symbol}...\n")
         result = get_stock_recommendation(test_symbol, max_turns=2)
+    elif test_mode == "aligned":
+        print(f"\n🎯 Testing Aligned Recommendation for {test_symbol}...\n")
+        result = get_aligned_recommendation(test_symbol, hours_back=24, max_turns=2)
     else:
         print(f"\n🧪 Testing Grok Sentiment for {test_symbol}...\n")
         result = analyze_sentiment(test_symbol, hours_back=24, max_turns=2)

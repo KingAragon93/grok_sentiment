@@ -9,3 +9,13 @@ pytz>=2024.1
 
 # HTTP requests (for Discord webhook)
 requests>=2.31.0
+
+# Data analysis and manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Google Cloud Storage (for reading historical logs)
+google-cloud-storage>=2.10.0
+
+# Environment variables
+python-dotenv>=1.0.0

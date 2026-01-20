@@ -383,143 +383,177 @@ def get_stock_recommendation(symbol: str, max_turns: int = 2):
 
 def get_aligned_recommendation(symbol: str, sentiment_score: float = None, hours_back: int = 24, max_turns: int = 2):
     """
-    Get an aligned buy/hold/sell recommendation that factors in sentiment score.
+    Get an aligned buy/hold/sell recommendation by asking Grok directly.
     
-    This function addresses the issue where high sentiment scores (8+, 9+) 
-    were not resulting in 'buy' recommendations.
-    
-    Based on historical analysis:
-    - Scores 9+ had +2.04% avg 24h return (58% accuracy) -> Strong BUY
-    - Scores 8-9 had -0.53% avg 24h return (45% accuracy) -> Weighted
-    - Best timeframe: 36h (70% accuracy)
+    This function combines sentiment analysis with buy/hold/sell recommendation
+    in a SINGLE Grok API call, asking Grok to provide both the sentiment score
+    AND the trading recommendation based on that sentiment.
     
     Args:
         symbol: Stock ticker symbol
-        sentiment_score: Optional pre-calculated sentiment score. If None, will analyze first.
+        sentiment_score: Optional pre-calculated sentiment score (ignored - we ask Grok fresh)
         hours_back: Hours of X posts to analyze (default 24)
         max_turns: Maximum tool call turns (default 2)
     
     Returns:
-        dict with aligned recommendation, sentiment_score, buy_signal, etc.
+        dict with sentiment_score, recommendation, buy_signal, confidence, etc.
     """
-    # If sentiment_score not provided, get it first
-    if sentiment_score is None:
-        sentiment_result = analyze_sentiment(symbol, hours_back=hours_back, max_turns=max_turns)
-        if sentiment_result.get("status") != "success":
-            return sentiment_result
-        sentiment_score = sentiment_result.get("sentiment_score", 0)
-        citations_count = sentiment_result.get("citations_count", 0)
-        sentiment_summary = sentiment_result.get("summary", "")
-    else:
-        citations_count = 0
-        sentiment_summary = ""
-    
-    # Apply calibrated thresholds based on historical analysis
-    # Scores 9+: Strong buy signal (historically +2.04% return)
-    # Scores 7.5-9: Buy signal with less confidence
-    # Scores 5-7.5: Moderate positive - could go either way
-    # Scores below 5: Hold or let the model decide
-    
-    STRONG_BUY_THRESHOLD = 9.0   # Historically +2.04% return, 58% accuracy
-    BUY_THRESHOLD = 7.5          # Buy territory
-    HOLD_THRESHOLD = 2.0         # Neutral territory
-    
-    # Determine sentiment-based recommendation
-    if sentiment_score >= STRONG_BUY_THRESHOLD:
-        # Strong sentiment override - don't even call the other API
-        aligned_recommendation = "buy"
-        buy_signal = True
-        alignment_reason = f"SENTIMENT OVERRIDE: Score {sentiment_score:.1f} >= {STRONG_BUY_THRESHOLD} (historically +2.04% avg return)"
-        confidence = "high"
-        
-        logger.info(f"✅ {symbol} | ALIGNED BUY (sentiment override) | Score: {sentiment_score:.1f}")
-        
+    if not XAI_SDK_AVAILABLE:
         return {
-            "status": "success",
-            "symbol": symbol,
-            "sentiment_score": sentiment_score,
-            "recommendation": aligned_recommendation,
-            "buy_signal": buy_signal,
-            "alignment_reason": alignment_reason,
-            "confidence": confidence,
-            "summary": sentiment_summary or f"High sentiment score of {sentiment_score:.1f} indicates strong bullish social sentiment.",
-            "citations_count": citations_count,
-            "recommended_hold_hours": 36,  # Best accuracy timeframe
-            "timestamp": now_et().isoformat()
+            "status": "error",
+            "reason": "xai_sdk not available. Install with: pip install xai-sdk>=1.5.0",
+            "symbol": symbol
         }
     
-    elif sentiment_score >= BUY_THRESHOLD:
-        # Good sentiment - lean towards buy but check with model
-        aligned_recommendation = "buy"
-        buy_signal = True
-        alignment_reason = f"SENTIMENT LEAN BUY: Score {sentiment_score:.1f} >= {BUY_THRESHOLD}"
-        confidence = "medium"
-        
-        logger.info(f"✅ {symbol} | ALIGNED BUY (sentiment lean) | Score: {sentiment_score:.1f}")
-        
+    if not XAI_API_KEY:
         return {
-            "status": "success",
-            "symbol": symbol,
-            "sentiment_score": sentiment_score,
-            "recommendation": aligned_recommendation,
-            "buy_signal": buy_signal,
-            "alignment_reason": alignment_reason,
-            "confidence": confidence,
-            "summary": sentiment_summary or f"Positive sentiment score of {sentiment_score:.1f} suggests bullish outlook.",
-            "citations_count": citations_count,
-            "recommended_hold_hours": 36,
-            "timestamp": now_et().isoformat()
+            "status": "error",
+            "reason": "XAI_API_KEY not configured in environment variables",
+            "symbol": symbol
         }
     
-    elif sentiment_score >= HOLD_THRESHOLD:
-        # Moderate sentiment - hold
-        aligned_recommendation = "hold"
-        buy_signal = False
-        alignment_reason = f"NEUTRAL SENTIMENT: Score {sentiment_score:.1f} in hold range"
-        confidence = "medium"
-        
-        logger.info(f"✅ {symbol} | ALIGNED HOLD | Score: {sentiment_score:.1f}")
-        
+    # Initialize client
+    try:
+        xai_client = XAIClient(api_key=XAI_API_KEY)
+        logger.info(f"✅ xAI client initialized for aligned recommendation: {symbol}")
+    except Exception as e:
         return {
-            "status": "success",
-            "symbol": symbol,
-            "sentiment_score": sentiment_score,
-            "recommendation": aligned_recommendation,
-            "buy_signal": buy_signal,
-            "alignment_reason": alignment_reason,
-            "confidence": confidence,
-            "summary": sentiment_summary or f"Neutral sentiment score of {sentiment_score:.1f} suggests holding.",
-            "citations_count": citations_count,
-            "recommended_hold_hours": 36,
-            "timestamp": now_et().isoformat()
+            "status": "error",
+            "reason": f"Failed to initialize xAI client: {e}",
+            "symbol": symbol
         }
     
-    else:
-        # Low/negative sentiment - hold or sell
-        if sentiment_score <= -5:
-            aligned_recommendation = "sell"
-            buy_signal = False
-            alignment_reason = f"NEGATIVE SENTIMENT: Score {sentiment_score:.1f} suggests selling"
-        else:
-            aligned_recommendation = "hold"
-            buy_signal = False
-            alignment_reason = f"LOW SENTIMENT: Score {sentiment_score:.1f} suggests caution"
+    # Calculate date ranges
+    now = datetime.datetime.now(pytz.UTC)
+    from_date = now - datetime.timedelta(hours=hours_back)
+    to_date = now
+    current_time_et = now_et()
+    formatted_time = current_time_et.strftime("%B %d, %Y, %I:%M %p ET")
+    
+    # Combined prompt: Get BOTH sentiment score AND buy/hold/sell recommendation
+    user_prompt = (
+        f"Analyze ${symbol} stock for a SHORT-TERM TRADE decision as of {formatted_time}. "
+        f"Search X/Twitter for posts from the last {hours_back} hours about ${symbol}. "
+        f"\n\nProvide your analysis as JSON with these exact keys:\n"
+        f"1. 'sentiment_score': number from -10 to +10 based on X/Twitter sentiment\n"
+        f"2. 'recommendation': MUST be exactly 'buy', 'hold', or 'sell' - your trading recommendation\n"
+        f"3. 'confidence': 'high', 'medium', or 'low' based on how confident you are\n"
+        f"4. 'summary': Brief explanation (under 100 words) of sentiment, catalysts, and why you recommend buy/hold/sell\n"
+        f"\n**IMPORTANT GUIDELINES**:\n"
+        f"- If sentiment_score >= 8.0, you should strongly consider 'buy' unless there are clear risks\n"
+        f"- If sentiment_score >= 6.0, lean towards 'buy' if momentum is positive\n"
+        f"- Be decisive - avoid defaulting to 'hold' when sentiment is clearly bullish\n"
+        f"- Consider: sentiment momentum, catalysts, price action alignment\n"
+        f"\nReturn ONLY the JSON object, no other text."
+    )
+    
+    start_time = time.time()
+    model_used = "grok-4-1-fast"
+    
+    try:
+        # Create chat with x_search tool
+        chat = xai_client.chat.create(
+            model=model_used,
+            tools=[
+                x_search(
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+            ],
+            max_turns=max_turns,
+        )
         
+        # Add the user message
+        chat.append(user(user_prompt))
+        
+        # Get the response (non-streaming)
+        response = chat.sample()
+        
+        api_call_duration = time.time() - start_time
+        response_content = response.content
+        
+        # Parse JSON from response
+        sentiment_score = 0.0
+        recommendation = "hold"
         confidence = "medium"
+        summary = "Unable to parse response"
+        alignment_reason = ""
         
-        logger.info(f"✅ {symbol} | ALIGNED {aligned_recommendation.upper()} | Score: {sentiment_score:.1f}")
+        try:
+            json_str = response_content
+            # Handle markdown code blocks
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(json_str)
+            sentiment_score = float(data.get("sentiment_score", 0.0))
+            recommendation = str(data.get("recommendation", "hold")).lower().strip()
+            confidence = str(data.get("confidence", "medium")).lower().strip()
+            summary = str(data.get("summary", "Summary not provided."))
+            
+            # Normalize recommendation
+            if recommendation not in ["buy", "hold", "sell"]:
+                recommendation = "hold"
+            
+            # Normalize confidence
+            if confidence not in ["high", "medium", "low"]:
+                confidence = "medium"
+            
+            # Create alignment reason based on Grok's decision
+            alignment_reason = f"GROK ANALYSIS: Score {sentiment_score:.1f}, recommends {recommendation.upper()} with {confidence} confidence"
+            
+            # Safety override: If sentiment is very high (9+) but Grok said hold, override to buy
+            if sentiment_score >= 9.0 and recommendation == "hold":
+                recommendation = "buy"
+                alignment_reason = f"SENTIMENT OVERRIDE: Score {sentiment_score:.1f} >= 9.0 overrides hold to buy"
+                logger.info(f"⚠️ {symbol} | Override: {sentiment_score:.1f} sentiment -> BUY")
+            
+        except (json.JSONDecodeError, IndexError) as parse_error:
+            logger.warning(f"JSON parse failed for {symbol} aligned: {parse_error}")
+            summary = response_content[:500] if response_content else "Unable to parse response"
+            alignment_reason = "PARSE_ERROR: Could not parse Grok response"
+        
+        # Determine buy_signal
+        buy_signal = recommendation == "buy"
+        
+        # Get usage stats
+        tool_usage = {}
+        if hasattr(response, 'server_side_tool_usage'):
+            tool_usage = dict(response.server_side_tool_usage) if response.server_side_tool_usage else {}
+        
+        citations_count = len(response.citations) if hasattr(response, 'citations') and response.citations else 0
+        
+        logger.info(f"✅ {symbol} | ALIGNED {recommendation.upper()} | Score: {sentiment_score:.1f} | Conf: {confidence} | Buy: {buy_signal}")
         
         return {
             "status": "success",
             "symbol": symbol,
             "sentiment_score": sentiment_score,
-            "recommendation": aligned_recommendation,
+            "recommendation": recommendation,
             "buy_signal": buy_signal,
-            "alignment_reason": alignment_reason,
             "confidence": confidence,
-            "summary": sentiment_summary or f"Low sentiment score of {sentiment_score:.1f} indicates caution.",
+            "alignment_reason": alignment_reason,
+            "summary": summary,
+            "raw_response": response_content,
             "citations_count": citations_count,
+            "tool_usage": tool_usage,
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
             "recommended_hold_hours": 36,
+            "timestamp": current_time_et.isoformat()
+        }
+        
+    except Exception as e:
+        api_call_duration = time.time() - start_time
+        logger.error(f"❌ Error getting aligned recommendation for {symbol}: {e}")
+        return {
+            "status": "error",
+            "symbol": symbol,
+            "reason": str(e),
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
             "timestamp": now_et().isoformat()
         }
 

@@ -21,4 +21,5 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
 # Run the application with functions-framework
-CMD exec functions-framework --target=grok_sentiment --port=$PORT
+# Target the aligned recommendation function for single unified endpoint
+CMD exec functions-framework --target=grok_aligned_recommendation --port=$PORT

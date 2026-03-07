@@ -272,6 +272,23 @@ See [MIGRATION_INSTRUCTIONS.txt](MIGRATION_INSTRUCTIONS.txt) for detailed migrat
 
 ---
 
+## Agent Documentation Maintenance
+
+Refresh and validate retrieval docs/indexes:
+
+```bash
+python scripts/refresh_agent_docs.py
+```
+
+Direct commands:
+
+```bash
+python scripts/validate_doc_references.py
+python scripts/generate_agent_symbol_index.py
+```
+
+---
+
 ## Clean Up
 
 ```bash

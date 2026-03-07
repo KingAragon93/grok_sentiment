@@ -30,3 +30,15 @@ Thumbs.db
 htmlcov/
 src/GoogleCloudServiceAccount.json
 MIGRATION_INSTRUCTIONS.txt
+
+# Agent scratch/local-clone hygiene
+_*.py
+_*.txt
+*.tmp
+*.bak
+
+# Local clone/cache artifacts
+.python-version
+.ruff_cache/
+.cache/
+.DS_Store

@@ -31,6 +31,7 @@ import json
 import logging
 import time
 import datetime
+from typing import Any, Dict, List
 import pytz
 import functions_framework
 from flask import jsonify
@@ -76,6 +77,190 @@ def get_et_timezone():
 def now_et():
     """Get current time in Eastern timezone."""
     return datetime.datetime.now(get_et_timezone())
+
+
+def _extract_json_object(response_content: str) -> Dict[str, Any]:
+    """Extract and parse a JSON object from plain text or fenced markdown output."""
+    if not response_content:
+        raise ValueError("Empty response content")
+
+    json_str = response_content
+    if "```json" in json_str:
+        json_str = json_str.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in json_str:
+        json_str = json_str.split("```", 1)[1].split("```", 1)[0].strip()
+
+    parsed = json.loads(json_str)
+    if not isinstance(parsed, dict):
+        raise ValueError("Parsed response is not a JSON object")
+    return parsed
+
+
+def get_grok_market_factors(ticker: str, max_turns: int = 3, catalyst_window_days: int = 60) -> Dict[str, Any]:
+    """
+    Analyze catalysts and sentiment to produce options-selection market factors.
+
+    Returns keys:
+      - recommended_min_days
+      - volatility_risk
+      - bias
+    """
+    symbol = (ticker or "").upper().strip()
+    if not symbol:
+        return {
+            "status": "error",
+            "reason": "Missing ticker symbol",
+            "symbol": symbol
+        }
+
+    if not XAI_SDK_AVAILABLE:
+        return {
+            "status": "error",
+            "reason": "xai_sdk not available. Install with: pip install xai-sdk>=1.5.0",
+            "symbol": symbol
+        }
+
+    if not XAI_API_KEY:
+        return {
+            "status": "error",
+            "reason": "XAI_API_KEY not configured in environment variables",
+            "symbol": symbol
+        }
+
+    try:
+        xai_client = XAIClient(api_key=XAI_API_KEY)
+    except Exception as e:
+        return {
+            "status": "error",
+            "reason": f"Failed to initialize xAI client: {e}",
+            "symbol": symbol
+        }
+
+    now = datetime.datetime.now(pytz.UTC)
+    from_date = now - datetime.timedelta(days=7)
+    to_date = now
+    model_used = "grok-4-1-fast"
+    start_time = time.time()
+
+    user_prompt = (
+        f"Analyze ${symbol} for an options-entry decision. "
+        f"Use recent X/Twitter and reputable news context, and identify upcoming catalysts in the next {catalyst_window_days} days. "
+        f"Catalysts to check include: earnings, FOMC/CPI/macro events, product launches, major legal/regulatory decisions. "
+        f"Return ONLY JSON with exactly these keys:\n"
+        f"1. 'key_dates': array of objects with 'event', 'date' (YYYY-MM-DD), and 'days_until' (int 0-{catalyst_window_days})\n"
+        f"2. 'sentiment_bias': one of 'Bullish', 'Bearish', 'Neutral'\n"
+        f"3. 'bias': one of 'Call' or 'Put'\n"
+        f"4. 'volatility_risk': integer from 1 to 10 (higher means more crowded/expensive options)\n"
+        f"5. 'rationale': brief explanation (max 120 words)"
+    )
+
+    try:
+        chat = xai_client.chat.create(
+            model=model_used,
+            tools=[x_search(from_date=from_date, to_date=to_date)],
+            max_turns=max_turns,
+        )
+        chat.append(user(user_prompt))
+        response = chat.sample()
+        api_call_duration = time.time() - start_time
+
+        response_content = response.content
+        parsed = _extract_json_object(response_content)
+
+        key_dates_raw = parsed.get("key_dates", [])
+        key_dates: List[Dict[str, Any]] = []
+        days_until_values: List[int] = []
+
+        if isinstance(key_dates_raw, list):
+            for item in key_dates_raw:
+                if not isinstance(item, dict):
+                    continue
+
+                event_name = str(item.get("event", "")).strip()[:120]
+                date_str = str(item.get("date", "")).strip()
+
+                days_until = item.get("days_until")
+                try:
+                    days_until_int = int(days_until)
+                except (TypeError, ValueError):
+                    days_until_int = None
+
+                if days_until_int is None and date_str:
+                    try:
+                        event_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                        days_until_int = (event_date - now.date()).days
+                    except ValueError:
+                        days_until_int = None
+
+                if days_until_int is None:
+                    continue
+
+                if days_until_int < 0 or days_until_int > catalyst_window_days:
+                    continue
+
+                days_until_values.append(days_until_int)
+                key_dates.append({
+                    "event": event_name or "Unknown catalyst",
+                    "date": date_str,
+                    "days_until": days_until_int
+                })
+
+        if days_until_values:
+            last_catalyst_days = max(days_until_values)
+            recommended_min_days = last_catalyst_days + 7
+        else:
+            last_catalyst_days = None
+            recommended_min_days = 14
+
+        raw_bias = str(parsed.get("bias") or parsed.get("sentiment_bias") or "").strip().lower()
+        if raw_bias in ("bearish", "put", "sell", "down"):
+            normalized_bias = "Put"
+        elif raw_bias in ("bullish", "call", "buy", "up"):
+            normalized_bias = "Call"
+        else:
+            normalized_bias = "Call"
+
+        try:
+            volatility_risk = int(parsed.get("volatility_risk", 5))
+        except (TypeError, ValueError):
+            volatility_risk = 5
+        volatility_risk = max(1, min(10, volatility_risk))
+
+        tool_usage = {}
+        if hasattr(response, 'server_side_tool_usage'):
+            tool_usage = dict(response.server_side_tool_usage) if response.server_side_tool_usage else {}
+
+        citations_count = len(response.citations) if hasattr(response, 'citations') and response.citations else 0
+
+        return {
+            "status": "success",
+            "symbol": symbol,
+            "recommended_min_days": int(recommended_min_days),
+            "volatility_risk": volatility_risk,
+            "bias": normalized_bias,
+            "sentiment_bias": str(parsed.get("sentiment_bias", "")).strip() or ("Bullish" if normalized_bias == "Call" else "Bearish"),
+            "last_catalyst_days": last_catalyst_days,
+            "key_dates": key_dates,
+            "rationale": str(parsed.get("rationale", "")).strip()[:500],
+            "raw_response": response_content,
+            "citations_count": citations_count,
+            "tool_usage": tool_usage,
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
+            "timestamp": now_et().isoformat()
+        }
+
+    except Exception as e:
+        api_call_duration = time.time() - start_time
+        logger.error(f"❌ Error getting market factors for {symbol}: {e}")
+        return {
+            "status": "error",
+            "symbol": symbol,
+            "reason": str(e),
+            "api_call_duration": round(api_call_duration, 2),
+            "model_used": model_used,
+            "timestamp": now_et().isoformat()
+        }
 
 
 def send_discord_message(webhook_url: str, message: str, embed: dict = None):
@@ -828,22 +1013,101 @@ def grok_aligned_recommendation(request):
     send_to_discord = request_json.get('send_to_discord', False)
     discord_webhook = request_json.get('discord_webhook_url', DISCORD_WEBHOOK_URL)
     
-    logger.info(f"🎯 Getting ALIGNED recommendation for {symbol} (hours_back={hours_back}, max_turns={max_turns})")
-    
-    # Run aligned recommendation (ONE API CALL - cost effective!)
-    result = get_aligned_recommendation(
-        symbol=symbol,
-        sentiment_score=None,  # Will analyze sentiment internally
-        hours_back=hours_back,
-        max_turns=max_turns
+    factors_mode = (
+        bool(request_json.get('market_factors'))
+        or str(request_json.get('analysis_type', '')).strip().lower() == 'market_factors'
+        or 'catalyst_window_days' in request_json
     )
+
+    if factors_mode:
+        catalyst_window_days = request_json.get('catalyst_window_days', 60)
+        logger.info(
+            f"🧭 Getting market factors for {symbol} via aligned endpoint "
+            f"(window_days={catalyst_window_days}, max_turns={max_turns})"
+        )
+        result = get_grok_market_factors(
+            ticker=symbol,
+            max_turns=max_turns,
+            catalyst_window_days=catalyst_window_days,
+        )
+    else:
+        logger.info(f"🎯 Getting ALIGNED recommendation for {symbol} (hours_back={hours_back}, max_turns={max_turns})")
+
+        # Run aligned recommendation (ONE API CALL - cost effective!)
+        result = get_aligned_recommendation(
+            symbol=symbol,
+            sentiment_score=None,  # Will analyze sentiment internally
+            hours_back=hours_back,
+            max_turns=max_turns
+        )
     
     # Send to Discord if requested
     if send_to_discord and discord_webhook:
-        embed = format_aligned_embed(result)
-        send_discord_message(discord_webhook, "", embed)
+        if factors_mode:
+            message = (
+                f"🧭 Market factors {result.get('symbol', symbol)} | "
+                f"Bias: {result.get('bias', 'N/A')} | "
+                f"Min Days: {result.get('recommended_min_days', 'N/A')} | "
+                f"Vol Risk: {result.get('volatility_risk', 'N/A')}"
+            )
+            send_discord_message(discord_webhook, message)
+        else:
+            embed = format_aligned_embed(result)
+            send_discord_message(discord_webhook, "", embed)
     
     return jsonify(result), 200, headers
+
+
+@functions_framework.http
+def grok_market_factors(request):
+    """
+    HTTP Cloud Function for catalyst-aware market factor analysis.
+
+    Request JSON body:
+    {
+        "symbol": "AAPL",                  # Required
+        "max_turns": 3,                     # Optional
+        "catalyst_window_days": 60          # Optional
+    }
+    """
+    if request.method == 'OPTIONS':
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Max-Age': '3600'
+        }
+        return ('', 204, headers)
+
+    headers = {'Access-Control-Allow-Origin': '*'}
+
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({"status": "error", "reason": "No JSON body provided"}), 400, headers
+    except Exception as e:
+        return jsonify({"status": "error", "reason": f"Failed to parse JSON: {e}"}), 400, headers
+
+    symbol = request_json.get('symbol', '').upper().strip()
+    if not symbol:
+        return jsonify({"status": "error", "reason": "Missing required parameter: symbol"}), 400, headers
+
+    max_turns = request_json.get('max_turns', 3)
+    catalyst_window_days = request_json.get('catalyst_window_days', 60)
+
+    logger.info(
+        f"🧭 Getting market factors for {symbol} "
+        f"(max_turns={max_turns}, window_days={catalyst_window_days})"
+    )
+
+    result = get_grok_market_factors(
+        ticker=symbol,
+        max_turns=max_turns,
+        catalyst_window_days=catalyst_window_days
+    )
+
+    status_code = 200 if result.get("status") == "success" else 500
+    return jsonify(result), status_code, headers
 
 
 def format_aligned_embed(result: dict) -> dict:

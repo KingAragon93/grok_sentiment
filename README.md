@@ -31,15 +31,30 @@ curl -X POST https://YOUR_URL/grok_aligned_recommendation \
 {
     "status": "success",
     "symbol": "SOFI",
-    "sentiment_score": 9.2,
-    "recommendation": "buy",
-    "buy_signal": true,
-    "confidence": "high",
-    "alignment_reason": "SENTIMENT OVERRIDE: Score 9.2 >= 9.0 (historically +2.04% avg return)",
+    "sentiment_score": 7.8,
+    "credible_score": 4.1,
+    "retail_score": 9.3,
+    "recommendation": "hold",
+    "buy_signal": false,
+    "confidence": "medium",
+    "signal_confidence": "medium",
+    "source_mode": "curated",
+    "handles_used": ["WSJmarkets", "charliebilello", "..."],
+    "bullish_pct": 68, "bearish_pct": 12, "neutral_pct": 20,
+    "sample_size": 74, "unique_authors": 49, "echo_ratio": 0.31,
+    "top_themes": ["breakout", "earnings"],
+    "top_sources": ["charliebilello", "unusual_whales"],
+    "contrarian_flags": ["retail euphoria well above credible coverage"],
+    "summary": "Retail chatter bullish on breakout narrative; credible voices more muted.",
+    "alignment_reason": "GROK SENTIMENT: score=7.8 credible=4.1 retail=9.3 source=curated; downstream script should gate on price before trading.",
     "recommended_hold_hours": 36,
-    "timestamp": "2026-01-13T10:30:00-05:00"
+    "timestamp": "2026-04-20T10:30:00-04:00"
 }
 ```
+
+> **Scope:** This service reports **social sentiment only**. It does NOT
+> read stock price. Downstream callers are expected to combine these signals
+> with price/market data before trading.
 
 ---
 
@@ -49,7 +64,8 @@ curl -X POST https://YOUR_URL/grok_aligned_recommendation \
 
 **Endpoint:** `POST /grok_aligned_recommendation`
 
-Combines sentiment analysis with buy/hold/sell decision in **one API call**. High sentiment scores automatically result in buy signals.
+Runs the sentiment intake (two-pass curated allow-list → open fallback) and
+returns a sentiment-only `recommendation` in a single API call.
 
 | Request Field | Type | Required | Default | Description |
 |---------------|------|----------|---------|-------------|
@@ -62,21 +78,26 @@ Combines sentiment analysis with buy/hold/sell decision in **one API call**. Hig
 **Response Fields:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `sentiment_score` | float | -10 to +10 sentiment score |
-| `recommendation` | string | "buy", "hold", or "sell" |
-| `buy_signal` | bool | True if recommendation is buy |
-| `confidence` | string | "high", "medium", or "low" |
-| `alignment_reason` | string | Why this recommendation was made |
+| `sentiment_score` | float | -10 to +10, credibility-weighted overall |
+| `credible_score` | float | -10 to +10, tier-1/tier-2 authors only |
+| `retail_score` | float | -10 to +10, tier-3/tier-4 authors only |
+| `bullish_pct` / `bearish_pct` / `neutral_pct` | int | Distribution of weighted posts |
+| `sample_size` | int | Distinct posts after dedupe |
+| `unique_authors` | int | Distinct authors considered |
+| `echo_ratio` | float | 0-1, share of retweets/near-duplicates |
+| `signal_confidence` | string | "low" / "medium" / "high" for the intake itself |
+| `source_mode` | string | `curated` (allow-list hit), `open_fallback` (allow-list empty, fell back to open search), or `open` (no allow-list configured) |
+| `handles_used` | array | X handles that were queried when source_mode=curated |
+| `top_sources` / `top_themes` / `contrarian_flags` | array | Drivers of the score |
+| `recommendation` | string | "buy", "hold", or "sell" based on SOCIAL SENTIMENT ONLY |
+| `buy_signal` | bool | True if recommendation is buy (not a trade signal by itself) |
+| `confidence` | string | Grok's confidence in the recommendation |
+| `alignment_reason` | string | Human-readable explanation |
 | `recommended_hold_hours` | int | Optimal holding period (36h) |
+| `summary` | string | One-sentence summary |
 
-**Calibrated Thresholds (based on historical analysis):**
-| Sentiment Score | Recommendation | Confidence | Historical Return |
-|-----------------|----------------|------------|-------------------|
-| ≥ 9.0 | BUY (override) | High | +2.04% avg (24h) |
-| ≥ 7.5 | BUY (lean) | Medium | varies |
-| ≥ 2.0 | HOLD | Medium | neutral |
-| < 2.0 | HOLD | Medium | caution |
-| ≤ -5.0 | SELL | Medium | negative |
+The allow-list lives in [`credible_handles.json`](credible_handles.json).
+Add or remove handles there to change what the curated pass searches.
 
 ---
 
@@ -84,7 +105,7 @@ Combines sentiment analysis with buy/hold/sell decision in **one API call**. Hig
 
 **Endpoint:** `POST /grok_sentiment`
 
-Get just the sentiment score without a recommendation.
+Same intake as the aligned endpoint, without a `recommendation`.
 
 ```json
 {
@@ -94,16 +115,9 @@ Get just the sentiment score without a recommendation.
 }
 ```
 
-**Response:**
-```json
-{
-    "status": "success",
-    "symbol": "SOFI",
-    "sentiment_score": 8.5,
-    "summary": "Bullish sentiment with heightened chart breakout discussions...",
-    "citations_count": 45
-}
-```
+Returns the full sentiment schema (`sentiment_score`, `credible_score`,
+`retail_score`, `source_mode`, `sample_size`, `echo_ratio`,
+`signal_confidence`, `top_sources`, `contrarian_flags`, `summary`, …).
 
 ---
 

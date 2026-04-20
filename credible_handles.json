@@ -7,11 +7,14 @@
     "business",
     "Reuters",
     "WSJ",
+    "WSJmarkets",
     "FT",
     "CNBC",
     "MarketWatch",
     "SquawkCNBC",
+    "StockMKTNewz",
     "LizAnnSonders",
+    "elerianm",
     "TheStalwart",
     "LisaAbramowicz1",
     "biancoresearch",
@@ -20,7 +23,11 @@
     "michaelsantoli",
     "IBDinvestors",
     "SpencerHakimian",
-    "zerohedge"
+    "zerohedge",
+    "PeterLBrandt",
+    "Ritholtz",
+    "bespokeinvest",
+    "markminervini"
   ],
   "excluded": []
 }

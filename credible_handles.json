@@ -1,0 +1,26 @@
+{
+  "_comment": "X/Twitter handles used as the primary source for sentiment intake. Edit freely. If zero posts are found from these handles for a ticker, the service falls back to an unrestricted search and marks source_mode='open_fallback'.",
+  "allowed": [
+    "charliebilello",
+    "unusual_whales",
+    "DeItaone",
+    "business",
+    "Reuters",
+    "WSJ",
+    "FT",
+    "CNBC",
+    "MarketWatch",
+    "SquawkCNBC",
+    "LizAnnSonders",
+    "TheStalwart",
+    "LisaAbramowicz1",
+    "biancoresearch",
+    "hmeisler",
+    "KobeissiLetter",
+    "michaelsantoli",
+    "IBDinvestors",
+    "SpencerHakimian",
+    "zerohedge"
+  ],
+  "excluded": []
+}

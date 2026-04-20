@@ -31,7 +31,7 @@ import json
 import logging
 import time
 import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import pytz
 import functions_framework
 from flask import jsonify
@@ -67,6 +67,103 @@ if XAI_API_KEY:
     logger.info("✅ XAI_API_KEY found in environment")
 else:
     logger.warning("⚠️ XAI_API_KEY not found in environment variables")
+
+
+CREDIBLE_HANDLES_FILE = os.path.join(os.path.dirname(__file__), 'credible_handles.json')
+
+
+def load_credible_handles() -> Dict[str, List[str]]:
+    """Load curated X/Twitter allow/exclude lists from credible_handles.json."""
+    try:
+        with open(CREDIBLE_HANDLES_FILE, 'r') as f:
+            data = json.load(f)
+        allowed = [h.strip().lstrip('@') for h in data.get('allowed', []) if h and isinstance(h, str)]
+        excluded = [h.strip().lstrip('@') for h in data.get('excluded', []) if h and isinstance(h, str)]
+        return {"allowed": allowed, "excluded": excluded}
+    except Exception as e:
+        logger.warning(f"Could not load credible_handles.json: {e}")
+        return {"allowed": [], "excluded": []}
+
+
+CREDIBILITY_RULES = (
+    "Apply CREDIBILITY WEIGHTING to each post when computing sentiment:\n"
+    "- 3x weight: verified financial journalists, licensed analysts, company IR/official accounts, SEC/regulator feeds\n"
+    "- 2x weight: accounts with >50k followers AND >1 year tenure AND a finance-focused bio/history\n"
+    "- 1x weight: ordinary retail accounts with a sustained posting history\n"
+    "- 0.25x weight: accounts <90 days old, <500 followers, or dominated by rocket/moon emoji spam\n"
+    "- 0x weight: obvious bots, paid promotion, or coordinated/copy-paste spam\n\n"
+    "Intake rules:\n"
+    "- Dedupe retweets and near-identical copies — count an echoing message ONCE.\n"
+    "- Weight the most recent third of the time window slightly higher than the oldest third.\n"
+    "- Assess SOCIAL SENTIMENT ONLY. Do NOT factor in current stock price, charts, or market data; downstream code handles price.\n"
+)
+
+SENTIMENT_JSON_SCHEMA = (
+    "- sentiment_score: number from -10 to +10 (overall, credibility-weighted)\n"
+    "- credible_score: number from -10 to +10 using ONLY tier-1 (3x) and tier-2 (2x) authors\n"
+    "- retail_score: number from -10 to +10 using ONLY tier-3 (1x) and tier-4 (0.25x) authors\n"
+    "- bullish_pct: integer 0-100, share of weighted posts that are bullish\n"
+    "- bearish_pct: integer 0-100, share of weighted posts that are bearish\n"
+    "- neutral_pct: integer 0-100, share of weighted posts that are neutral\n"
+    "- sample_size: integer, distinct posts considered after dedupe\n"
+    "- unique_authors: integer, distinct authors considered\n"
+    "- echo_ratio: number 0.0-1.0, share of posts that were retweets/near-duplicates\n"
+    "- signal_confidence: one of 'low', 'medium', 'high' based on sample size, credible coverage, and echo\n"
+    "- top_themes: array of up to 3 short theme strings (e.g. 'earnings beat', 'breakout')\n"
+    "- top_sources: array of up to 5 X handles (no '@') that drove the score\n"
+    "- contrarian_flags: array of short strings for warning signs (e.g. 'high retail euphoria with low credible coverage', 'likely coordinated pump')\n"
+    "- summary: ONE sentence, max 100 words, covering sentiment direction, main catalyst, and any divergence between credible_score and retail_score\n"
+)
+
+
+def _parse_sentiment_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize the expanded sentiment JSON schema from Grok's response."""
+
+    def _num(key: str, default: float = 0.0) -> float:
+        try:
+            return float(data.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _int(key: str, default: int = 0) -> int:
+        try:
+            return int(float(data.get(key, default)))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _str_list(key: str, limit: int = None) -> List[str]:
+        val = data.get(key, [])
+        if not isinstance(val, list):
+            return []
+        cleaned = [str(x).strip().lstrip('@') for x in val if x]
+        return cleaned[:limit] if limit else cleaned
+
+    confidence = str(data.get("signal_confidence", "medium")).lower().strip()
+    if confidence not in ("low", "medium", "high"):
+        confidence = "medium"
+
+    return {
+        "sentiment_score": _num("sentiment_score"),
+        "credible_score": _num("credible_score"),
+        "retail_score": _num("retail_score"),
+        "bullish_pct": max(0, min(100, _int("bullish_pct"))),
+        "bearish_pct": max(0, min(100, _int("bearish_pct"))),
+        "neutral_pct": max(0, min(100, _int("neutral_pct"))),
+        "sample_size": max(0, _int("sample_size")),
+        "unique_authors": max(0, _int("unique_authors")),
+        "echo_ratio": max(0.0, min(1.0, _num("echo_ratio"))),
+        "signal_confidence": confidence,
+        "top_themes": _str_list("top_themes", 3),
+        "top_sources": _str_list("top_sources", 5),
+        "contrarian_flags": _str_list("contrarian_flags"),
+        "summary": str(data.get("summary", "Summary not provided.")),
+    }
+
+
+def _downgrade_confidence(level: str) -> str:
+    """Knock signal_confidence down by one notch (used when falling back to open search)."""
+    mapping = {"high": "medium", "medium": "low", "low": "low"}
+    return mapping.get((level or "").lower(), "low")
 
 
 def get_et_timezone():
@@ -287,17 +384,127 @@ def send_discord_message(webhook_url: str, message: str, embed: dict = None):
         return False
 
 
+def _build_sentiment_prompt(symbol: str, hours_back: int, require_recommendation: bool = False) -> str:
+    """Build the prompt for a sentiment (and optionally recommendation) analysis."""
+    intro = (
+        f"Analyze X/Twitter sentiment for ${symbol} stock over the last {hours_back} hours.\n"
+        f"Compare the most recent {max(1, hours_back // 2)}h vs the previous {max(1, hours_back // 2)}h "
+        f"to detect sentiment shifts.\n\n"
+    )
+    extra_schema = ""
+    extra_guidance = ""
+    if require_recommendation:
+        extra_schema = (
+            "- recommendation: MUST be exactly 'buy', 'hold', or 'sell', based on social sentiment ONLY "
+            "(downstream code will factor in price/market data before acting)\n"
+            "- confidence: one of 'low', 'medium', 'high'\n"
+        )
+        extra_guidance = (
+            "\nRecommendation guidance:\n"
+            "- Base recommendation on credible_score more than retail_score. If credible_score is flat but "
+            "retail_score is very high, lean 'hold' and note it in contrarian_flags.\n"
+            "- Be decisive when credible authors agree; use 'hold' when credible coverage is thin.\n"
+        )
+
+    return (
+        intro
+        + CREDIBILITY_RULES
+        + extra_guidance
+        + "\nReturn ONLY a JSON object with exactly these keys:\n"
+        + SENTIMENT_JSON_SCHEMA
+        + extra_schema
+        + "\nNo prose outside the JSON."
+    )
+
+
+def _extract_parsed_data(response_content: str, symbol: str, context: str) -> Dict[str, Any]:
+    """Extract JSON from a Grok response, tolerating code fences."""
+    if not response_content:
+        return {}
+    json_str = response_content
+    if "```json" in json_str:
+        json_str = json_str.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in json_str:
+        json_str = json_str.split("```", 1)[1].split("```", 1)[0].strip()
+    try:
+        data = json.loads(json_str)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except (json.JSONDecodeError, IndexError) as parse_error:
+        logger.warning(f"JSON parse failed for {symbol} ({context}): {parse_error}")
+        return {}
+
+
+def _run_sentiment_pass(
+    xai_client,
+    symbol: str,
+    hours_back: int,
+    max_turns: int,
+    prompt: str,
+    allowed_handles: Optional[List[str]],
+    excluded_handles: Optional[List[str]],
+) -> Dict[str, Any]:
+    """Single call to Grok with x_search. Returns raw/response metadata + parsed JSON."""
+    now = datetime.datetime.now(pytz.UTC)
+    from_date = now - datetime.timedelta(hours=hours_back)
+    to_date = now
+
+    tool_kwargs = {"from_date": from_date, "to_date": to_date}
+    if allowed_handles:
+        tool_kwargs["allowed_x_handles"] = allowed_handles
+    if excluded_handles:
+        tool_kwargs["excluded_x_handles"] = excluded_handles
+
+    chat = xai_client.chat.create(
+        model="grok-4-1-fast",
+        tools=[x_search(**tool_kwargs)],
+        max_turns=max_turns,
+    )
+    chat.append(user(prompt))
+    response = chat.sample()
+
+    response_content = response.content or ""
+    parsed = _extract_parsed_data(response_content, symbol, "sentiment")
+
+    tool_usage = {}
+    if hasattr(response, 'server_side_tool_usage'):
+        tool_usage = dict(response.server_side_tool_usage) if response.server_side_tool_usage else {}
+
+    citations_raw = list(response.citations) if hasattr(response, 'citations') and response.citations else []
+    citations_count = len(citations_raw)
+    citations_sample = citations_raw[:10]
+
+    return {
+        "parsed": parsed,
+        "response_content": response_content,
+        "citations_count": citations_count,
+        "citations_sample": citations_sample,
+        "tool_usage": tool_usage,
+    }
+
+
+# Minimum citations required from a curated-handle search before we accept it.
+MIN_CURATED_CITATIONS = 1
+
+
 def analyze_sentiment(symbol: str, hours_back: int = 24, max_turns: int = 2):
     """
-    Analyze sentiment for a stock symbol using xAI Agent Tools API.
-    
+    Analyze X/Twitter sentiment for a stock symbol using xAI Agent Tools API.
+
+    Two-pass search:
+      1) restrict to handles in credible_handles.json (allow-list)
+      2) if no posts matched, fall back to an unrestricted search and mark
+         source_mode='open_fallback' + downgrade signal_confidence by one tier.
+
     Args:
         symbol: Stock ticker symbol (e.g., "SOFI", "AAPL")
         hours_back: How many hours of X posts to analyze (default 24)
         max_turns: Maximum tool call turns for cost control (default 2)
-    
+
     Returns:
-        dict with sentiment_score, summary, citations_count, etc.
+        dict with sentiment_score, summary, credible_score, retail_score,
+        sample_size, echo_ratio, signal_confidence, top_sources, etc.
     """
     if not XAI_SDK_AVAILABLE:
         return {
@@ -305,15 +512,14 @@ def analyze_sentiment(symbol: str, hours_back: int = 24, max_turns: int = 2):
             "reason": "xai_sdk not available. Install with: pip install xai-sdk>=1.5.0",
             "symbol": symbol
         }
-    
+
     if not XAI_API_KEY:
         return {
             "status": "error",
             "reason": "XAI_API_KEY not configured in environment variables",
             "symbol": symbol
         }
-    
-    # Initialize client
+
     try:
         xai_client = XAIClient(api_key=XAI_API_KEY)
         logger.info(f"✅ xAI client initialized for {symbol}")
@@ -323,92 +529,82 @@ def analyze_sentiment(symbol: str, hours_back: int = 24, max_turns: int = 2):
             "reason": f"Failed to initialize xAI client: {e}",
             "symbol": symbol
         }
-    
-    # Calculate date ranges
-    now = datetime.datetime.now(pytz.UTC)
-    from_date = now - datetime.timedelta(hours=hours_back)
-    to_date = now
-    
-    # User prompt for sentiment analysis
-    user_prompt = (
-        f"Analyze sentiment for ${symbol} stock on X/Twitter. "
-        f"Search for posts from the last {hours_back} hours about ${symbol}. "
-        f"Compare the last {hours_back//2} hours vs previous {hours_back//2} hours to detect any sentiment shifts. "
-        f"Provide your analysis as JSON with exactly these keys: "
-        f"'sentiment_score' (number from -10 to +10), "
-        f"'summary' (ONE sentence max 100 words: sentiment shift direction, main catalyst, price alignment). "
-        f"Return ONLY the JSON object, no other text."
-    )
-    
+
+    handles = load_credible_handles()
+    allowed = handles["allowed"]
+    excluded = handles["excluded"]
+    prompt = _build_sentiment_prompt(symbol, hours_back, require_recommendation=False)
+
     start_time = time.time()
     model_used = "grok-4-1-fast"
-    
+    source_mode = "open"
+    fallback_used = False
+
     try:
-        # Create chat with x_search tool only (cost-efficient)
-        chat = xai_client.chat.create(
-            model=model_used,
-            tools=[
-                x_search(
-                    from_date=from_date,
-                    to_date=to_date,
-                )
-            ],
-            max_turns=max_turns,
-        )
-        
-        # Add the user message
-        chat.append(user(user_prompt))
-        
-        # Get the response (non-streaming)
-        response = chat.sample()
-        
+        pass_result = None
+        if allowed:
+            logger.info(f"🔎 {symbol} | curated pass ({len(allowed)} handles)")
+            pass_result = _run_sentiment_pass(
+                xai_client, symbol, hours_back, max_turns, prompt,
+                allowed_handles=allowed, excluded_handles=excluded,
+            )
+            source_mode = "curated"
+            if pass_result.get("citations_count", 0) < MIN_CURATED_CITATIONS:
+                logger.info(f"↪️ {symbol} | no curated citations, falling back to open search")
+                pass_result = None
+                fallback_used = True
+
+        if pass_result is None:
+            pass_result = _run_sentiment_pass(
+                xai_client, symbol, hours_back, max_turns, prompt,
+                allowed_handles=None, excluded_handles=excluded,
+            )
+            source_mode = "open_fallback" if fallback_used else "open"
+
         api_call_duration = time.time() - start_time
-        response_content = response.content
-        
-        # Parse JSON from response
-        sentiment_score = 0.0
-        summary = "Unable to parse response"
-        
-        try:
-            json_str = response_content
-            # Handle markdown code blocks
-            if "```json" in json_str:
-                json_str = json_str.split("```json")[1].split("```")[0].strip()
-            elif "```" in json_str:
-                json_str = json_str.split("```")[1].split("```")[0].strip()
-            
-            data = json.loads(json_str)
-            sentiment_score = float(data.get("sentiment_score", 0.0))
-            summary = str(data.get("summary", "Summary not provided."))
-        except (json.JSONDecodeError, IndexError) as parse_error:
-            logger.warning(f"JSON parse failed for {symbol}: {parse_error}")
-            summary = response_content[:500] if response_content else "Unable to parse response"
-        
-        # Get usage stats
-        tool_usage = {}
-        if hasattr(response, 'server_side_tool_usage'):
-            tool_usage = dict(response.server_side_tool_usage) if response.server_side_tool_usage else {}
-        
-        citations_count = len(response.citations) if hasattr(response, 'citations') and response.citations else 0
-        citations = list(response.citations)[:10] if hasattr(response, 'citations') and response.citations else []
-        
-        logger.info(f"✅ {symbol} analyzed | Score: {sentiment_score:.1f}/10 | Time: {api_call_duration:.2f}s | Citations: {citations_count}")
-        
-        return {
+
+        parsed = pass_result["parsed"]
+        response_content = pass_result["response_content"]
+
+        if parsed:
+            sentiment_fields = _parse_sentiment_fields(parsed)
+        else:
+            sentiment_fields = _parse_sentiment_fields({})
+            sentiment_fields["summary"] = (response_content or "Unable to parse response")[:500]
+            sentiment_fields["signal_confidence"] = "low"
+
+        if fallback_used:
+            sentiment_fields["signal_confidence"] = _downgrade_confidence(
+                sentiment_fields["signal_confidence"]
+            )
+
+        citations_count = pass_result["citations_count"]
+
+        logger.info(
+            f"✅ {symbol} | score={sentiment_fields['sentiment_score']:.1f} "
+            f"credible={sentiment_fields['credible_score']:.1f} "
+            f"retail={sentiment_fields['retail_score']:.1f} "
+            f"source={source_mode} citations={citations_count} "
+            f"time={api_call_duration:.2f}s"
+        )
+
+        result = {
             "status": "success",
             "symbol": symbol,
-            "sentiment_score": sentiment_score,
-            "summary": summary,
+            **sentiment_fields,
+            "source_mode": source_mode,
+            "handles_used": allowed if source_mode == "curated" else [],
             "raw_response": response_content,
             "citations_count": citations_count,
-            "citations_sample": citations,
-            "tool_usage": tool_usage,
+            "citations_sample": pass_result["citations_sample"],
+            "tool_usage": pass_result["tool_usage"],
             "api_call_duration": round(api_call_duration, 2),
             "model_used": model_used,
             "hours_back": hours_back,
-            "timestamp": now_et().isoformat()
+            "timestamp": now_et().isoformat(),
         }
-        
+        return result
+
     except Exception as e:
         api_call_duration = time.time() - start_time
         logger.error(f"❌ Error analyzing {symbol}: {e}")
@@ -568,20 +764,21 @@ def get_stock_recommendation(symbol: str, max_turns: int = 2):
 
 def get_aligned_recommendation(symbol: str, sentiment_score: float = None, hours_back: int = 24, max_turns: int = 2):
     """
-    Get an aligned buy/hold/sell recommendation by asking Grok directly.
-    
-    This function combines sentiment analysis with buy/hold/sell recommendation
-    in a SINGLE Grok API call, asking Grok to provide both the sentiment score
-    AND the trading recommendation based on that sentiment.
-    
+    Get a sentiment-only buy/hold/sell recommendation by asking Grok directly.
+
+    Uses the same curated-handle + fallback intake as analyze_sentiment, and asks
+    Grok to produce a social-sentiment recommendation. Downstream code is expected
+    to gate on price/market data before acting on this signal.
+
     Args:
         symbol: Stock ticker symbol
-        sentiment_score: Optional pre-calculated sentiment score (ignored - we ask Grok fresh)
+        sentiment_score: Ignored (retained for API compatibility)
         hours_back: Hours of X posts to analyze (default 24)
         max_turns: Maximum tool call turns (default 2)
-    
+
     Returns:
-        dict with sentiment_score, recommendation, buy_signal, confidence, etc.
+        dict with sentiment_score, recommendation, buy_signal, confidence,
+        credible_score, retail_score, sample_size, echo_ratio, source_mode, etc.
     """
     if not XAI_SDK_AVAILABLE:
         return {
@@ -589,15 +786,14 @@ def get_aligned_recommendation(symbol: str, sentiment_score: float = None, hours
             "reason": "xai_sdk not available. Install with: pip install xai-sdk>=1.5.0",
             "symbol": symbol
         }
-    
+
     if not XAI_API_KEY:
         return {
             "status": "error",
             "reason": "XAI_API_KEY not configured in environment variables",
             "symbol": symbol
         }
-    
-    # Initialize client
+
     try:
         xai_client = XAIClient(api_key=XAI_API_KEY)
         logger.info(f"✅ xAI client initialized for aligned recommendation: {symbol}")
@@ -607,129 +803,104 @@ def get_aligned_recommendation(symbol: str, sentiment_score: float = None, hours
             "reason": f"Failed to initialize xAI client: {e}",
             "symbol": symbol
         }
-    
-    # Calculate date ranges
-    now = datetime.datetime.now(pytz.UTC)
-    from_date = now - datetime.timedelta(hours=hours_back)
-    to_date = now
+
     current_time_et = now_et()
-    formatted_time = current_time_et.strftime("%B %d, %Y, %I:%M %p ET")
-    
-    # Combined prompt: Get BOTH sentiment score AND buy/hold/sell recommendation
-    user_prompt = (
-        f"Analyze ${symbol} stock for a SHORT-TERM TRADE decision as of {formatted_time}. "
-        f"Search X/Twitter for posts from the last {hours_back} hours about ${symbol}. "
-        f"\n\nProvide your analysis as JSON with these exact keys:\n"
-        f"1. 'sentiment_score': number from -10 to +10 based on X/Twitter sentiment\n"
-        f"2. 'recommendation': MUST be exactly 'buy', 'hold', or 'sell' - your trading recommendation\n"
-        f"3. 'confidence': 'high', 'medium', or 'low' based on how confident you are\n"
-        f"4. 'summary': Brief explanation (under 100 words) of sentiment, catalysts, and why you recommend buy/hold/sell\n"
-        f"\n**IMPORTANT GUIDELINES**:\n"
-        f"- If sentiment_score >= 8.0, you should strongly consider 'buy' unless there are clear risks\n"
-        f"- If sentiment_score >= 6.0, lean towards 'buy' if momentum is positive\n"
-        f"- Be decisive - avoid defaulting to 'hold' when sentiment is clearly bullish\n"
-        f"- Consider: sentiment momentum, catalysts, price action alignment\n"
-        f"\nReturn ONLY the JSON object, no other text."
-    )
-    
+    handles = load_credible_handles()
+    allowed = handles["allowed"]
+    excluded = handles["excluded"]
+    prompt = _build_sentiment_prompt(symbol, hours_back, require_recommendation=True)
+
     start_time = time.time()
     model_used = "grok-4-1-fast"
-    
+    source_mode = "open"
+    fallback_used = False
+
     try:
-        # Create chat with x_search tool
-        chat = xai_client.chat.create(
-            model=model_used,
-            tools=[
-                x_search(
-                    from_date=from_date,
-                    to_date=to_date,
-                )
-            ],
-            max_turns=max_turns,
-        )
-        
-        # Add the user message
-        chat.append(user(user_prompt))
-        
-        # Get the response (non-streaming)
-        response = chat.sample()
-        
+        pass_result = None
+        if allowed:
+            logger.info(f"🔎 {symbol} | curated aligned pass ({len(allowed)} handles)")
+            pass_result = _run_sentiment_pass(
+                xai_client, symbol, hours_back, max_turns, prompt,
+                allowed_handles=allowed, excluded_handles=excluded,
+            )
+            source_mode = "curated"
+            if pass_result.get("citations_count", 0) < MIN_CURATED_CITATIONS:
+                logger.info(f"↪️ {symbol} | aligned: no curated citations, falling back to open search")
+                pass_result = None
+                fallback_used = True
+
+        if pass_result is None:
+            pass_result = _run_sentiment_pass(
+                xai_client, symbol, hours_back, max_turns, prompt,
+                allowed_handles=None, excluded_handles=excluded,
+            )
+            source_mode = "open_fallback" if fallback_used else "open"
+
         api_call_duration = time.time() - start_time
-        response_content = response.content
-        
-        # Parse JSON from response
-        sentiment_score = 0.0
-        recommendation = "hold"
-        confidence = "medium"
-        summary = "Unable to parse response"
-        alignment_reason = ""
-        
-        try:
-            json_str = response_content
-            # Handle markdown code blocks
-            if "```json" in json_str:
-                json_str = json_str.split("```json")[1].split("```")[0].strip()
-            elif "```" in json_str:
-                json_str = json_str.split("```")[1].split("```")[0].strip()
-            
-            data = json.loads(json_str)
-            sentiment_score = float(data.get("sentiment_score", 0.0))
-            recommendation = str(data.get("recommendation", "hold")).lower().strip()
-            confidence = str(data.get("confidence", "medium")).lower().strip()
-            summary = str(data.get("summary", "Summary not provided."))
-            
-            # Normalize recommendation
-            if recommendation not in ["buy", "hold", "sell"]:
-                recommendation = "hold"
-            
-            # Normalize confidence
-            if confidence not in ["high", "medium", "low"]:
-                confidence = "medium"
-            
-            # Create alignment reason based on Grok's decision
-            alignment_reason = f"GROK ANALYSIS: Score {sentiment_score:.1f}, recommends {recommendation.upper()} with {confidence} confidence"
-            
-            # Safety override: If sentiment is very high (9+) but Grok said hold, override to buy
-            if sentiment_score >= 9.0 and recommendation == "hold":
-                recommendation = "buy"
-                alignment_reason = f"SENTIMENT OVERRIDE: Score {sentiment_score:.1f} >= 9.0 overrides hold to buy"
-                logger.info(f"⚠️ {symbol} | Override: {sentiment_score:.1f} sentiment -> BUY")
-            
-        except (json.JSONDecodeError, IndexError) as parse_error:
-            logger.warning(f"JSON parse failed for {symbol} aligned: {parse_error}")
-            summary = response_content[:500] if response_content else "Unable to parse response"
+
+        parsed = pass_result["parsed"]
+        response_content = pass_result["response_content"]
+
+        if parsed:
+            sentiment_fields = _parse_sentiment_fields(parsed)
+            recommendation = str(parsed.get("recommendation", "hold")).lower().strip()
+            confidence = str(parsed.get("confidence", sentiment_fields["signal_confidence"])).lower().strip()
+            alignment_reason = (
+                f"GROK SENTIMENT: score={sentiment_fields['sentiment_score']:.1f} "
+                f"credible={sentiment_fields['credible_score']:.1f} "
+                f"retail={sentiment_fields['retail_score']:.1f} "
+                f"source={source_mode}; downstream script should gate on price before trading."
+            )
+        else:
+            sentiment_fields = _parse_sentiment_fields({})
+            sentiment_fields["summary"] = (response_content or "Unable to parse response")[:500]
+            sentiment_fields["signal_confidence"] = "low"
+            recommendation = "hold"
+            confidence = "low"
             alignment_reason = "PARSE_ERROR: Could not parse Grok response"
-        
-        # Determine buy_signal
+
+        if recommendation not in ("buy", "hold", "sell"):
+            recommendation = "hold"
+        if confidence not in ("low", "medium", "high"):
+            confidence = "medium"
+
+        if fallback_used:
+            sentiment_fields["signal_confidence"] = _downgrade_confidence(
+                sentiment_fields["signal_confidence"]
+            )
+            confidence = _downgrade_confidence(confidence)
+
         buy_signal = recommendation == "buy"
-        
-        # Get usage stats
-        tool_usage = {}
-        if hasattr(response, 'server_side_tool_usage'):
-            tool_usage = dict(response.server_side_tool_usage) if response.server_side_tool_usage else {}
-        
-        citations_count = len(response.citations) if hasattr(response, 'citations') and response.citations else 0
-        
-        logger.info(f"✅ {symbol} | ALIGNED {recommendation.upper()} | Score: {sentiment_score:.1f} | Conf: {confidence} | Buy: {buy_signal}")
-        
+        citations_count = pass_result["citations_count"]
+
+        logger.info(
+            f"✅ {symbol} | aligned rec={recommendation.upper()} "
+            f"score={sentiment_fields['sentiment_score']:.1f} "
+            f"credible={sentiment_fields['credible_score']:.1f} "
+            f"retail={sentiment_fields['retail_score']:.1f} "
+            f"source={source_mode} citations={citations_count}"
+        )
+
         return {
             "status": "success",
             "symbol": symbol,
-            "sentiment_score": sentiment_score,
+            **sentiment_fields,
             "recommendation": recommendation,
             "buy_signal": buy_signal,
             "confidence": confidence,
             "alignment_reason": alignment_reason,
-            "summary": summary,
+            "source_mode": source_mode,
+            "handles_used": allowed if source_mode == "curated" else [],
             "raw_response": response_content,
             "citations_count": citations_count,
-            "tool_usage": tool_usage,
+            "citations_sample": pass_result["citations_sample"],
+            "tool_usage": pass_result["tool_usage"],
             "api_call_duration": round(api_call_duration, 2),
             "model_used": model_used,
             "recommended_hold_hours": 36,
             "timestamp": current_time_et.isoformat()
         }
-        
+
     except Exception as e:
         api_call_duration = time.time() - start_time
         logger.error(f"❌ Error getting aligned recommendation for {symbol}: {e}")
@@ -1138,49 +1309,53 @@ def format_aligned_embed(result: dict) -> dict:
     # Confidence emoji
     conf_emoji = "🔥" if confidence == "high" else "📊" if confidence == "medium" else "❓"
     
+    credible_score = result.get("credible_score", 0.0) or 0.0
+    retail_score = result.get("retail_score", 0.0) or 0.0
+    sample_size = result.get("sample_size", 0) or 0
+    echo_ratio = result.get("echo_ratio", 0.0) or 0.0
+    source_mode = result.get("source_mode", "open")
+    flags = result.get("contrarian_flags") or []
+    top_sources = result.get("top_sources") or []
+
+    fields = [
+        {"name": "Overall Score", "value": f"📈 **{sentiment_score:.1f}** / 10", "inline": True},
+        {"name": "Credible vs Retail",
+         "value": f"🏦 {credible_score:.1f}  |  📣 {retail_score:.1f}",
+         "inline": True},
+        {"name": "Recommendation",
+         "value": f"{emoji} **{recommendation.upper()}**",
+         "inline": True},
+        {"name": "Confidence", "value": f"{conf_emoji} {confidence.upper()}", "inline": True},
+        {"name": "Sample / Echo",
+         "value": f"🧪 {sample_size} posts · 🔁 {echo_ratio:.2f}",
+         "inline": True},
+        {"name": "Source Mode", "value": f"🎯 {source_mode}", "inline": True},
+    ]
+    if top_sources:
+        fields.append({
+            "name": "Top Sources",
+            "value": ", ".join(f"@{h}" for h in top_sources[:5]),
+            "inline": False,
+        })
+    if flags:
+        fields.append({
+            "name": "Contrarian Flags",
+            "value": "\n".join(f"• {f}" for f in flags[:5])[:1024],
+            "inline": False,
+        })
+    fields.append({
+        "name": "Alignment Reason",
+        "value": (result.get("alignment_reason") or "N/A")[:1024],
+        "inline": False,
+    })
+
     return {
         "title": f"🎯 Aligned Recommendation: {result.get('symbol')}",
         "description": result.get("summary", "No summary available")[:4000],
         "color": color,
-        "fields": [
-            {
-                "name": "Sentiment Score",
-                "value": f"📈 **{sentiment_score:.1f}** / 10",
-                "inline": True
-            },
-            {
-                "name": "Recommendation",
-                "value": f"{emoji} **{recommendation.upper()}**",
-                "inline": True
-            },
-            {
-                "name": "Buy Signal",
-                "value": f"{'✅ YES' if buy_signal else '❌ NO'}",
-                "inline": True
-            },
-            {
-                "name": "Confidence",
-                "value": f"{conf_emoji} {confidence.upper()}",
-                "inline": True
-            },
-            {
-                "name": "Hold Period",
-                "value": f"⏱️ {result.get('recommended_hold_hours', 36)}h",
-                "inline": True
-            },
-            {
-                "name": "Citations",
-                "value": f"📰 {result.get('citations_count', 0)}",
-                "inline": True
-            },
-            {
-                "name": "Alignment Reason",
-                "value": result.get("alignment_reason", "N/A")[:1024],
-                "inline": False
-            }
-        ],
+        "fields": fields,
         "footer": {
-            "text": "Powered by xAI Grok | Aligned Sentiment + Recommendation"
+            "text": "Powered by xAI Grok | Social sentiment only — downstream code applies price gating"
         },
         "timestamp": result.get("timestamp", now_et().isoformat())
     }

@@ -39,6 +39,20 @@ class AlignedRecommendationLog:
     alignment_reason: str
     citations_count: int
     recommended_hold_hours: int
+    # Expanded sentiment intake fields (optional; populated when available)
+    credible_score: Optional[float] = None
+    retail_score: Optional[float] = None
+    bullish_pct: Optional[int] = None
+    bearish_pct: Optional[int] = None
+    neutral_pct: Optional[int] = None
+    sample_size: Optional[int] = None
+    unique_authors: Optional[int] = None
+    echo_ratio: Optional[float] = None
+    signal_confidence: Optional[str] = None
+    source_mode: Optional[str] = None  # curated | open | open_fallback
+    top_sources: Optional[List[str]] = None
+    top_themes: Optional[List[str]] = None
+    contrarian_flags: Optional[List[str]] = None
     # Price tracking fields (filled in later by analysis)
     price_at_recommendation: Optional[float] = None
     price_4h: Optional[float] = None
@@ -144,7 +158,20 @@ class GCSAlignedLogger:
             confidence=result.get("confidence", "medium"),
             alignment_reason=result.get("alignment_reason", ""),
             citations_count=result.get("citations_count", 0),
-            recommended_hold_hours=result.get("recommended_hold_hours", 36)
+            recommended_hold_hours=result.get("recommended_hold_hours", 36),
+            credible_score=result.get("credible_score"),
+            retail_score=result.get("retail_score"),
+            bullish_pct=result.get("bullish_pct"),
+            bearish_pct=result.get("bearish_pct"),
+            neutral_pct=result.get("neutral_pct"),
+            sample_size=result.get("sample_size"),
+            unique_authors=result.get("unique_authors"),
+            echo_ratio=result.get("echo_ratio"),
+            signal_confidence=result.get("signal_confidence"),
+            source_mode=result.get("source_mode"),
+            top_sources=result.get("top_sources"),
+            top_themes=result.get("top_themes"),
+            contrarian_flags=result.get("contrarian_flags"),
         )
         
         # Load existing logs

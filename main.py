@@ -34,6 +34,7 @@ import datetime
 from typing import Any, Dict, List
 import pytz
 import functions_framework
+import guardrails
 from flask import jsonify
 
 # Configure logging
@@ -137,7 +138,8 @@ def get_grok_market_factors(ticker: str, max_turns: int = 3, catalyst_window_day
         }
 
     now = datetime.datetime.now(pytz.UTC)
-    from_date = now - datetime.timedelta(days=7)
+    # Live search bills per source read — window capped via grok_sentiment_config.json
+    from_date = now - datetime.timedelta(hours=guardrails.get_search_window_hours(market_factors=True))
     to_date = now
     model_used = "grok-4-1-fast"
     start_time = time.time()
@@ -157,7 +159,7 @@ def get_grok_market_factors(ticker: str, max_turns: int = 3, catalyst_window_day
     try:
         chat = xai_client.chat.create(
             model=model_used,
-            tools=[x_search(from_date=from_date, to_date=to_date)],
+            tools=[x_search(from_date=from_date, to_date=to_date, allowed_x_handles=guardrails.get_allowed_handles())],
             max_turns=max_turns,
         )
         chat.append(user(user_prompt))
@@ -324,7 +326,8 @@ def analyze_sentiment(symbol: str, hours_back: int = 24, max_turns: int = 2):
             "symbol": symbol
         }
     
-    # Calculate date ranges
+    # Calculate date ranges (lookback clamped via grok_sentiment_config.json)
+    hours_back = guardrails.get_search_window_hours(hours_back)
     now = datetime.datetime.now(pytz.UTC)
     from_date = now - datetime.timedelta(hours=hours_back)
     to_date = now
@@ -351,6 +354,7 @@ def analyze_sentiment(symbol: str, hours_back: int = 24, max_turns: int = 2):
                 x_search(
                     from_date=from_date,
                     to_date=to_date,
+                    allowed_x_handles=guardrails.get_allowed_handles(),
                 )
             ],
             max_turns=max_turns,
@@ -464,7 +468,8 @@ def get_stock_recommendation(symbol: str, max_turns: int = 2):
     
     # Calculate date ranges for x_search
     now_utc = datetime.datetime.now(pytz.UTC)
-    from_date = now_utc - datetime.timedelta(hours=72)  # Look back 72 hours for context
+    # Was a fixed 72h; live search bills per source — clamped via grok_sentiment_config.json
+    from_date = now_utc - datetime.timedelta(hours=guardrails.get_search_window_hours())
     to_date = now_utc
     
     # User prompt for stock recommendation
@@ -491,6 +496,7 @@ def get_stock_recommendation(symbol: str, max_turns: int = 2):
                 x_search(
                     from_date=from_date,
                     to_date=to_date,
+                    allowed_x_handles=guardrails.get_allowed_handles(),
                 )
             ],
             max_turns=max_turns,
@@ -609,6 +615,7 @@ def get_aligned_recommendation(symbol: str, sentiment_score: float = None, hours
         }
     
     # Calculate date ranges
+    hours_back = guardrails.get_search_window_hours(hours_back)
     now = datetime.datetime.now(pytz.UTC)
     from_date = now - datetime.timedelta(hours=hours_back)
     to_date = now
@@ -643,6 +650,7 @@ def get_aligned_recommendation(symbol: str, sentiment_score: float = None, hours
                 x_search(
                     from_date=from_date,
                     to_date=to_date,
+                    allowed_x_handles=guardrails.get_allowed_handles(),
                 )
             ],
             max_turns=max_turns,
@@ -1008,6 +1016,18 @@ def grok_aligned_recommendation(request):
             "reason": "Missing required parameter: symbol"
         }), 400, headers
     
+    # Hourly call budget (grok_sentiment_config.json). Live search bills per
+    # source read, so runaway callers get a clean 429 instead of a bill.
+    budget_ok, budget_count, budget_limit = guardrails.check_call_budget()
+    if not budget_ok:
+        logger.warning(f"🚫 Grok call budget exceeded ({budget_count}/{budget_limit} this hour) — rejecting {symbol}")
+        return jsonify({
+            "status": "error",
+            "reason": f"grok call budget exceeded ({budget_count}/{budget_limit} per hour) — raise max_calls_per_hour in grok_sentiment_config.json if intended",
+            "symbol": symbol,
+            "budget_exceeded": True
+        }), 429, headers
+
     hours_back = request_json.get('hours_back', 24)
     max_turns = request_json.get('max_turns', 2)
     send_to_discord = request_json.get('send_to_discord', False)
